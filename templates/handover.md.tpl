@@ -1,52 +1,47 @@
-# 离职交接文档（初版）
+# ${module_name} 交接
 
-- 任务编号：`${task_id}`
-- 目标仓库：`${repo_path}`
-- 交接人：`${owner}`
-- 审阅人：`${reviewer}`
-- 主要受众：`${audience}`
-- 生成时间：`${created_at}`
+## 目标
 
-## 1. 交接范围
+${goal_section}
 
-本次扫描的目标路径：
-${target_paths}
+## 主链
 
-边界说明：
-${scope_notes}
+```text
+${main_chain_section}
+```
 
-## 2. 模块职责
+## 一页结论
 
-${responsibility_section}
+${summary_section}
 
-## 3. 关键入口与目录
+## 模块总览
 
-${entry_section}
+${overview_section}
 
-## 4. 核心依赖
+## 统一会话主链
 
-${dependency_section}
+${session_chain_section}
 
-## 5. 主要流程
+## 导出与运行时主链
 
-${flow_section}
+${runtime_chain_section}
 
-## 6. 关键代码锚点
+## 关键边界
 
-${code_evidence_section}
+${boundary_section}
 
-## 7. 变更影响与回归建议
+## 修改时必须验证
 
-${change_impact_section}
+${verification_section}
 
-## 8. 风险与技术债
+## 推荐阅读顺序
 
-${risk_section}
+${reading_order_section}
 
-## 9. 接手建议
+## 待补充信息
 
-${handover_section}
+${open_questions_section}
 
-## 10. 参考证据
+## 主要参考资料
 
-${evidence_section}
+${reference_material_section}

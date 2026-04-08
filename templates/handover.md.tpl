@@ -31,14 +31,22 @@ ${dependency_section}
 
 ${flow_section}
 
-## 6. 风险与技术债
+## 6. 关键代码锚点
+
+${code_evidence_section}
+
+## 7. 变更影响与回归建议
+
+${change_impact_section}
+
+## 8. 风险与技术债
 
 ${risk_section}
 
-## 7. 接手建议
+## 9. 接手建议
 
 ${handover_section}
 
-## 8. 参考证据
+## 10. 参考证据
 
 ${evidence_section}

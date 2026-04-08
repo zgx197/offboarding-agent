@@ -125,6 +125,8 @@ MAX_TEXT_FILE_SIZE = 256 * 1024
 MAX_EVIDENCE_SNIPPET_CHARS = 1200
 MAX_EVIDENCE_PER_TYPE = 20
 MAX_RELATED_REFERENCE_FILES = 12
+MAX_CODE_EVIDENCE_ITEMS = 18
+MAX_CODE_EVIDENCE_PER_FILE = 2
 
 
 @dataclass(frozen=True)
@@ -211,7 +213,14 @@ def run_workflow(args: argparse.Namespace) -> int:
     evidence = collect_evidence(repo_path, target_paths)
     write_json(run_dir / "evidence.json", [item.as_dict() for item in evidence])
 
-    handover_markdown = render_handover(task, evidence)
+    understanding_dir = run_dir / "understanding"
+    understanding_dir.mkdir(exist_ok=True)
+    code_registry = build_code_evidence_registry(repo_path, target_paths, evidence, task)
+    write_json(understanding_dir / "14-code-evidence-registry.json", code_registry)
+    change_impact_matrix = render_change_impact_matrix(task, code_registry)
+    (understanding_dir / "15-change-impact-matrix.md").write_text(change_impact_matrix, encoding="utf-8")
+
+    handover_markdown = render_handover(task, evidence, code_registry)
     (run_dir / "handover.md").write_text(handover_markdown, encoding="utf-8")
 
     questions_markdown = render_open_questions(task, evidence)
@@ -231,6 +240,8 @@ def run_workflow(args: argparse.Namespace) -> int:
     print(f"  - {run_dir / 'scan-summary.md'}")
     print(f"  - {run_dir / 'handover.md'}")
     print(f"  - {run_dir / 'open-questions.md'}")
+    print(f"  - {understanding_dir / '14-code-evidence-registry.json'}")
+    print(f"  - {understanding_dir / '15-change-impact-matrix.md'}")
     return 0
 
 
@@ -516,7 +527,11 @@ def make_evidence_item(
     )
 
 
-def render_handover(task: dict[str, object], evidence: list[EvidenceItem]) -> str:
+def render_handover(
+    task: dict[str, object],
+    evidence: list[EvidenceItem],
+    code_registry: dict[str, object] | None = None,
+) -> str:
     template = load_template("handover.md.tpl")
     target_paths = "\n".join(f"- `{path}`" for path in task["targetPaths"])
     scope_notes = [
@@ -536,8 +551,10 @@ def render_handover(task: dict[str, object], evidence: list[EvidenceItem]) -> st
     entry_section = render_evidence_bullets(entrypoints, empty_message="未发现明显入口文件，建议优先从目录树与配置文件入手排查。")
     dependency_section = render_dependency_section(configs, related_refs)
     flow_section = render_flow_section(entrypoints, scripts, docs, related_refs)
+    code_evidence_section = render_code_evidence_section(code_registry or {})
+    change_impact_section = render_change_impact_section(code_registry or {})
     risk_section = render_risk_section(task, evidence)
-    handover_section = render_handover_advice(entrypoints, configs, docs, scripts, related_refs)
+    handover_section = render_handover_advice(entrypoints, configs, docs, scripts, related_refs, code_registry or {})
     evidence_section = render_reference_section(evidence)
 
     return template.substitute(
@@ -553,6 +570,8 @@ def render_handover(task: dict[str, object], evidence: list[EvidenceItem]) -> st
         entry_section=entry_section,
         dependency_section=dependency_section,
         flow_section=flow_section,
+        code_evidence_section=code_evidence_section,
+        change_impact_section=change_impact_section,
         risk_section=risk_section,
         handover_section=handover_section,
         evidence_section=evidence_section,
@@ -585,6 +604,660 @@ def render_scan_summary(task: dict[str, object], evidence: list[EvidenceItem]) -
         counts=counts,
         highlighted="\n".join(highlighted) if highlighted else "- 无高亮证据",
     )
+
+
+def build_code_evidence_registry(
+    repo_path: Path,
+    target_paths: list[Path],
+    evidence: list[EvidenceItem],
+    task: dict[str, object],
+) -> dict[str, object]:
+    candidates: list[tuple[int, EvidenceItem, Path]] = []
+    priority = {
+        "entrypoint": 0,
+        "config": 1,
+        "source": 2,
+        "script": 3,
+        "related_reference": 4,
+    }
+
+    for item in evidence:
+        if item.type not in priority:
+            continue
+        file_path = repo_path / item.path
+        if file_path.exists() and file_path.is_file():
+            candidates.append((priority[item.type], item, file_path))
+
+    items: list[dict[str, object]] = []
+    seen_keys: set[tuple[str, str, int]] = set()
+
+    for _, evidence_item, file_path in sorted(
+        candidates,
+        key=lambda part: (
+            compute_code_candidate_score(part[1]) + part[0] * 15,
+            part[1].path.lower(),
+        ),
+    ):
+        if len(items) >= MAX_CODE_EVIDENCE_ITEMS:
+            break
+
+        for anchor in extract_code_anchors(repo_path, target_paths, file_path, evidence_item):
+            key = (str(anchor["path"]), str(anchor["symbol"]), int(anchor["startLine"]))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            anchor["id"] = f"code-{len(items) + 1:03d}"
+            items.append(anchor)
+            if len(items) >= MAX_CODE_EVIDENCE_ITEMS:
+                break
+
+    return {
+        "meta": {
+            "taskId": task["taskId"],
+            "module": format_module_label(task),
+            "updatedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "confidence": "medium",
+        },
+        "items": items,
+    }
+
+
+def extract_code_anchors(
+    repo_path: Path,
+    target_paths: list[Path],
+    file_path: Path,
+    evidence_item: EvidenceItem,
+) -> list[dict[str, object]]:
+    text = read_text_content(file_path)
+    if not text:
+        return []
+
+    relative_path = to_posix(file_path.relative_to(repo_path))
+    inside_target = any(file_path.is_relative_to(target) for target in target_paths)
+    category = categorize_code_path(relative_path, evidence_item.type)
+    anchors: list[dict[str, object]] = []
+    suffix = file_path.suffix.lower()
+
+    if suffix in {".cs", ".java", ".js", ".jsx", ".ts", ".tsx", ".py"}:
+        anchors.extend(extract_symbol_anchors(relative_path, text, evidence_item, inside_target, category))
+    elif suffix in {".json", ".yaml", ".yml", ".xml", ".props", ".targets", ".asmdef", ".csproj", ".sln"}:
+        anchors.extend(extract_config_anchors(relative_path, text, evidence_item, inside_target, category))
+    else:
+        anchors.extend(extract_file_level_anchor(relative_path, text, evidence_item, inside_target, category))
+
+    return anchors[:MAX_CODE_EVIDENCE_PER_FILE]
+
+
+def extract_symbol_anchors(
+    relative_path: str,
+    text: str,
+    evidence_item: EvidenceItem,
+    inside_target: bool,
+    category: str,
+) -> list[dict[str, object]]:
+    anchors: list[dict[str, object]] = []
+    class_pattern = re.compile(
+        r"^\s*(?:public|internal|private|protected)?\s*(?:sealed\s+|static\s+|abstract\s+|partial\s+)*"
+        r"(class|interface|struct|enum)\s+([A-Za-z_][A-Za-z0-9_]*)",
+        re.MULTILINE,
+    )
+    method_pattern = re.compile(
+        r"^\s*(?:public|internal|private|protected)\s+"
+        r"(?:static\s+|virtual\s+|override\s+|abstract\s+|sealed\s+|async\s+|extern\s+|new\s+|partial\s+)*"
+        r"[\w<>\[\],?.]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+        re.MULTILINE,
+    )
+
+    matches: list[tuple[int, str, str]] = []
+    for match in class_pattern.finditer(text):
+        name = match.group(2)
+        if is_high_signal_symbol(name, relative_path, evidence_item.type):
+            matches.append((match.start(), "type", name))
+
+    for match in method_pattern.finditer(text):
+        name = match.group(1)
+        if is_high_signal_symbol(name, relative_path, evidence_item.type):
+            matches.append((match.start(), "method", name))
+
+    if not matches:
+        return extract_file_level_anchor(relative_path, text, evidence_item, inside_target, category)
+
+    for position, kind, name in sorted(matches, key=lambda part: part[0])[:MAX_CODE_EVIDENCE_PER_FILE]:
+        line_no = compute_line_number(text, position)
+        anchors.append(
+            make_code_anchor(
+                relative_path=relative_path,
+                kind=kind,
+                symbol=name,
+                line_no=line_no,
+                evidence_item=evidence_item,
+                inside_target=inside_target,
+                category=category,
+            )
+        )
+    return anchors
+
+
+def extract_config_anchors(
+    relative_path: str,
+    text: str,
+    evidence_item: EvidenceItem,
+    inside_target: bool,
+    category: str,
+) -> list[dict[str, object]]:
+    patterns = [
+        re.compile(r'"name"\s*:\s*"([^"]+)"'),
+        re.compile(r'"noEngineReferences"\s*:\s*(true|false)', re.IGNORECASE),
+        re.compile(r"Project\(.*?\)\s*=\s*\"([^\"]+)\""),
+        re.compile(r"<PackageReference[^>]+Include=\"([^\"]+)\"", re.IGNORECASE),
+    ]
+    anchors: list[dict[str, object]] = []
+
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            label = match.group(1)
+            line_no = compute_line_number(text, match.start())
+            anchors.append(
+                make_code_anchor(
+                    relative_path=relative_path,
+                    kind="config",
+                    symbol=label,
+                    line_no=line_no,
+                    evidence_item=evidence_item,
+                    inside_target=inside_target,
+                    category=category,
+                )
+            )
+            if len(anchors) >= MAX_CODE_EVIDENCE_PER_FILE:
+                return anchors
+
+    return anchors or extract_file_level_anchor(relative_path, text, evidence_item, inside_target, category)
+
+
+def extract_file_level_anchor(
+    relative_path: str,
+    text: str,
+    evidence_item: EvidenceItem,
+    inside_target: bool,
+    category: str,
+) -> list[dict[str, object]]:
+    line_no = first_non_empty_line_number(text)
+    return [
+        make_code_anchor(
+            relative_path=relative_path,
+            kind="file",
+            symbol=Path(relative_path).name,
+            line_no=line_no,
+            evidence_item=evidence_item,
+            inside_target=inside_target,
+            category=category,
+        )
+    ]
+
+
+def make_code_anchor(
+    relative_path: str,
+    kind: str,
+    symbol: str,
+    line_no: int,
+    evidence_item: EvidenceItem,
+    inside_target: bool,
+    category: str,
+) -> dict[str, object]:
+    metadata = build_anchor_metadata(relative_path, evidence_item, category)
+    return {
+        "scope": "in_target" if inside_target else "outside_target_consumer",
+        "kind": kind,
+        "path": relative_path,
+        "symbol": symbol,
+        "startLine": line_no,
+        "endLine": line_no,
+        "role": metadata["role"],
+        "supports": metadata["supports"],
+        "impacts": metadata["impacts"],
+        "linkedEvidence": [evidence_item.id],
+        "consumers": metadata["consumers"],
+        "confidence": metadata["confidence"],
+        "notes": metadata["notes"],
+    }
+
+
+def build_anchor_metadata(relative_path: str, evidence_item: EvidenceItem, category: str) -> dict[str, object]:
+    configs: dict[str, dict[str, object]] = {
+        "entrypoint": {
+            "role": "用于定位入口启动链中的关键代码锚点。",
+            "supports": ["入口层如何进入当前模块或工作流。"],
+            "impacts": ["入口启动链", "参数传递", "场景或应用打开流程"],
+            "consumers": ["entry_and_request"],
+            "confidence": "medium",
+            "notes": "适合和会话或配置层一起联读。",
+        },
+        "session": {
+            "role": "用于定位会话、路由或状态分流的关键代码锚点。",
+            "supports": ["会话模型、路由规则或状态派生方式。"],
+            "impacts": ["会话模型", "路由规则", "状态派生"],
+            "consumers": ["session_host"],
+            "confidence": "medium",
+            "notes": "改这一层通常会波及上下游多个链路。",
+        },
+        "home_map": {
+            "role": "用于定位 HomeMap 专属接入、数据或导出行为的关键代码锚点。",
+            "supports": ["HomeMap 的专属工作流、产物或接入方式。"],
+            "impacts": ["HomeMap 工作流", "HomeMap 产物", "命名场景处理"],
+            "consumers": ["home_map_stack"],
+            "confidence": "medium",
+            "notes": "HomeMap 既属于统一宿主，又保留专属实现。",
+        },
+        "export": {
+            "role": "用于定位导出上下文、执行计划或导出步骤的关键代码锚点。",
+            "supports": ["导出链如何收集上下文并执行。"],
+            "impacts": ["导出上下文", "导出计划", "导出产物"],
+            "consumers": ["export_sync"],
+            "confidence": "medium",
+            "notes": "导出问题通常要同时检查 context 和 pipeline。",
+        },
+        "sync": {
+            "role": "用于定位同步上下文、同步目录或同步计划的关键代码锚点。",
+            "supports": ["同步链如何选择源目录和目标目录。"],
+            "impacts": ["同步上下文", "外部目录同步", "目标路径"],
+            "consumers": ["export_sync"],
+            "confidence": "medium",
+            "notes": "同步问题往往和个人设置或外部目录有关。",
+        },
+        "runtime": {
+            "role": "用于定位运行时契约或运行时消费边界的关键代码锚点。",
+            "supports": ["运行时真正消费的目录、schema 或边界约束。"],
+            "impacts": ["运行时契约", "对外同步", "下游消费"],
+            "consumers": ["runtime_contracts"],
+            "confidence": "medium",
+            "notes": "适合和导出产物、外部消费者一起联读。",
+        },
+        "bridge": {
+            "role": "用于定位跨模块或外部系统桥接的关键代码锚点。",
+            "supports": ["模块的上下游耦合点和外部消费者。"],
+            "impacts": ["外部桥接", "集成边界", "联调回归"],
+            "consumers": ["integration_bridges"],
+            "confidence": "medium",
+            "notes": "桥接改动最容易引发隐性联动问题。",
+        },
+        "config": {
+            "role": "用于定位配置、程序集或依赖声明中的关键代码锚点。",
+            "supports": ["路径、依赖或程序集边界的正式声明。"],
+            "impacts": ["配置边界", "程序集依赖", "构建或运行约束"],
+            "consumers": ["config_naming"],
+            "confidence": "medium",
+            "notes": "配置改动往往不是本仓库单点问题。",
+        },
+    }
+    resolved = configs.get(category, configs["config"]).copy()
+    if evidence_item.type == "related_reference":
+        resolved["consumers"] = ["integration_bridges"]
+        resolved["notes"] = "该锚点位于 targetPaths 之外，用于补齐真实上下游影响面。"
+    if "framesync" in relative_path.lower():
+        resolved["consumers"] = ["runtime_contracts"]
+        resolved["impacts"] = ["运行时契约", "外部同步", "编译边界"]
+    return resolved
+
+
+def render_change_impact_matrix(task: dict[str, object], code_registry: dict[str, object]) -> str:
+    template = load_template("understanding/15-change-impact-matrix.md.tpl")
+    rows = build_change_impact_rows(code_registry.get("items", []))
+    matrix_rows = "\n".join(
+        "| {change_surface} | `{locations}` | {direct_layer} | {downstream} | {contracts} | {regressions} | {risk} | {code_refs} | {evidence_refs} |".format(
+            change_surface=row["change_surface"],
+            locations="` `".join(row["locations"]),
+            direct_layer=row["direct_layer"],
+            downstream=row["downstream"],
+            contracts=row["contracts"],
+            regressions=row["regressions"],
+            risk=row["risk"],
+            code_refs=" ".join(f"`{code_id}`" for code_id in row["code_ids"]),
+            evidence_refs=" ".join(f"`{ev_id}`" for ev_id in row["evidence_ids"]) or "`ev-unknown`",
+        )
+        for row in rows
+    ) or "| 未识别到稳定改动面 | `N/A` | config | 需人工补充 | 需人工补充 | 需人工补充 | medium | `code-unknown` | `ev-unknown` |"
+
+    high_risk_rows = [row for row in rows if row["risk"] == "high"][:3]
+    high_risk_sections = "\n\n".join(render_high_risk_section(row) for row in high_risk_rows)
+    top_risk_items = "\n".join(
+        f"{index}. {row['change_surface']}" for index, row in enumerate(high_risk_rows[:3], start=1)
+    ) or "1. 需要人工补充\n2. 需要人工补充\n3. 需要人工补充"
+
+    return template.substitute(
+        task_id=task["taskId"],
+        module_path=format_module_label(task),
+        updated_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+        matrix_rows=matrix_rows,
+        high_risk_sections=high_risk_sections,
+        top_risk_items=top_risk_items,
+    )
+
+
+def build_change_impact_rows(code_items: list[dict[str, object]]) -> list[dict[str, object]]:
+    definitions = [
+        (
+            "entrypoint",
+            "修改入口与请求构造",
+            "host/config",
+            "启动参数、入口行为和上游输入会变化",
+            "`SceneSessionRequest`、入口参数、打开或创建策略",
+            "启动主流程、参数显示、入口可达性",
+            "high",
+        ),
+        (
+            "session",
+            "修改会话、路由或状态派生",
+            "host/subsystem",
+            "会话分流、显示名、稳定标识和 capability 判断会变化",
+            "会话模型、路由规则、状态派生结果",
+            "启动、显示名、关键分支、相关导出或同步链",
+            "high",
+        ),
+        (
+            "home_map",
+            "修改 HomeMap 专属工作流或命名产物",
+            "subsystem/runtime/config",
+            "HomeMap 启动、恢复、导出和运行时消费会变化",
+            "HomeMap 命名约定、RuntimePackage、蓝图或导航产物",
+            "HomeMap 启动、保存、导出、下游消费",
+            "high",
+        ),
+        (
+            "export",
+            "修改导出上下文或导出计划",
+            "subsystem/config",
+            "导出目录、步骤依赖和产物写出结果会变化",
+            "`ExportContext`、导出步骤、导出目录",
+            "一键导出、单步导出、产物目录检查",
+            "high",
+        ),
+        (
+            "sync",
+            "修改同步上下文或同步计划",
+            "subsystem/config/manual_process",
+            "源目录、目标目录和外部同步结果会变化",
+            "`SyncContext`、同步目录、同步计划",
+            "同步预览、目标目录、关键外部工程验证",
+            "high",
+        ),
+        (
+            "runtime",
+            "修改运行时契约或运行时消费边界",
+            "runtime/contract",
+            "运行时 schema、外部同步或下游加载方式会变化",
+            "运行时 schema、asmdef、运行时目录",
+            "运行时加载、外部同步、编译边界检查",
+            "high",
+        ),
+        (
+            "bridge",
+            "修改外部桥接与相关引用",
+            "bridge/subsystem",
+            "上下游模块联调点和外部消费者会变化",
+            "桥接接口、外部路径、集成上下文",
+            "桥接打开流程、上下游联调、路径校验",
+            "medium",
+        ),
+        (
+            "config",
+            "修改配置、程序集或依赖声明",
+            "config",
+            "依赖、路径和构建约束会变化",
+            "程序集依赖、配置键、路径约束",
+            "配置读取、编译、运行环境检查",
+            "medium",
+        ),
+    ]
+
+    rows: list[dict[str, object]] = []
+    for category, label, direct_layer, downstream, contracts, regressions, risk in definitions:
+        matched = [item for item in code_items if infer_change_surface_category(item) == category]
+        if not matched:
+            continue
+
+        locations = sorted({str(item["path"]) for item in matched})[:3]
+        code_ids = [str(item["id"]) for item in matched[:6]]
+        evidence_ids = sorted(
+            {
+                linked_id
+                for item in matched
+                for linked_id in item.get("linkedEvidence", [])
+            }
+        )[:6]
+
+        rows.append(
+            {
+                "change_surface": label,
+                "locations": locations,
+                "direct_layer": direct_layer,
+                "downstream": downstream,
+                "contracts": contracts,
+                "regressions": regressions,
+                "risk": risk,
+                "code_ids": code_ids,
+                "evidence_ids": evidence_ids,
+            }
+        )
+    return rows
+
+
+def render_high_risk_section(row: dict[str, object]) -> str:
+    locations = "、".join(f"`{path}`" for path in row["locations"])
+    code_refs = " ".join(f"`{code_id}`" for code_id in row["code_ids"])
+    evidence_refs = " ".join(f"`{ev_id}`" for ev_id in row["evidence_ids"])
+    return "\n".join(
+        [
+            f"### 变更面：{row['change_surface']}",
+            "",
+            f"- 为什么有人会改这里：这一层直接承接 {row['contracts']}，是常见的统一、修复或扩展入口。",
+            f"- 典型编辑位置：{locations}",
+            f"- 直接影响层：{row['direct_layer']}",
+            "",
+            "#### 立即影响",
+            "",
+            f"- {row['downstream']}",
+            "",
+            "#### 连锁影响",
+            "",
+            f"- `{row['contracts']}` 相关链路会一起受影响。",
+            f"- `{row['regressions']}` 对应的回归面需要一起检查。",
+            "",
+            "#### 最容易漏掉的回归项",
+            "",
+            f"- {row['regressions']}",
+            "",
+            "#### 推荐验证顺序",
+            "",
+            "1. 先验证直接编辑位置对应的主流程",
+            "2. 再检查相关契约、目录或产物是否变化",
+            "3. 最后补一轮下游消费者或外部联调验证",
+            "",
+            "#### 代码证据",
+            "",
+            f"- {code_refs}",
+            "",
+            "#### 主要证据",
+            "",
+            f"- {evidence_refs}",
+        ]
+    )
+
+
+def infer_change_surface_category(code_item: dict[str, object]) -> str:
+    path = str(code_item.get("path", "")).lower()
+    if "/editor/windows/" in path or "/editor/homemap/windows/" in path:
+        return "entrypoint"
+    if "/editor/session/" in path:
+        return "session"
+    if "/editor/homemap/" in path or "/runtime/homemap/" in path:
+        return "home_map"
+    if "/editor/export/" in path:
+        return "export"
+    if "/editor/sync/" in path:
+        return "sync"
+    if "/runtime/" in path:
+        return "runtime"
+    if "bridge" in path or "integration" in path or code_item.get("scope") == "outside_target_consumer":
+        return "bridge"
+    return "config"
+
+
+def compute_code_candidate_score(evidence_item: EvidenceItem) -> int:
+    path = evidence_item.path.lower()
+    high_signal_names = {
+        "entrywindow",
+        "editorsession",
+        "sceneoperationrouter",
+        "homemapsceneprofile",
+        "homemapmodulesetregistration",
+        "homemapmodule",
+        "exportcontext",
+        "synccontext",
+        "exportpipeline",
+        "syncpipeline",
+        "runtimepackageexportservice",
+        "framesync",
+        "bootstrap",
+        "bridge",
+    }
+    medium_signal_names = {
+        "profile",
+        "session",
+        "router",
+        "pipeline",
+        "context",
+        "module",
+        "entry",
+    }
+    low_signal_names = {
+        "datamanager",
+        "debugwindow",
+        "gui",
+        "events",
+        "actions",
+    }
+
+    score = 100
+    for name in high_signal_names:
+        if name in path:
+            score -= 50
+    for name in medium_signal_names:
+        if name in path:
+            score -= 20
+    for name in low_signal_names:
+        if name in path:
+            score += 20
+    if evidence_item.type == "related_reference":
+        score += 10
+    return score
+
+
+def extract_priority_code_paths(code_registry: dict[str, object], limit: int = 3) -> list[str]:
+    if not isinstance(code_registry, dict):
+        return []
+    items = code_registry.get("items", [])
+    if not isinstance(items, list):
+        return []
+    paths = [str(item.get("path", "")) for item in items if item.get("path")]
+    return dedupe_keep_order(paths)[:limit]
+
+
+def dedupe_keep_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def read_text_content(file_path: Path) -> str:
+    try:
+        return file_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            return file_path.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                return file_path.read_text(encoding="gb18030")
+            except UnicodeDecodeError:
+                return ""
+
+
+def is_high_signal_symbol(symbol_name: str, relative_path: str, evidence_type: str) -> bool:
+    if evidence_type == "entrypoint":
+        return True
+    high_signal_prefixes = (
+        "Start",
+        "Build",
+        "Create",
+        "Execute",
+        "Load",
+        "Save",
+        "Open",
+        "Register",
+        "Validate",
+        "TryGet",
+        "Get",
+        "Handle",
+        "Stop",
+        "Restore",
+        "Mark",
+    )
+    high_signal_keywords = (
+        "Session",
+        "Profile",
+        "Module",
+        "Pipeline",
+        "Context",
+        "Router",
+        "Window",
+        "Bridge",
+        "Service",
+        "Bootstrap",
+    )
+    return symbol_name.startswith(high_signal_prefixes) or any(keyword in symbol_name for keyword in high_signal_keywords) or any(
+        keyword.lower() in relative_path.lower() for keyword in ("session", "pipeline", "router", "profile", "module", "bridge")
+    )
+
+
+def categorize_code_path(relative_path: str, evidence_type: str) -> str:
+    lowered = relative_path.lower()
+    if evidence_type == "entrypoint" or "/editor/windows/" in lowered:
+        return "entrypoint"
+    if "/editor/session/" in lowered:
+        return "session"
+    if "/editor/homemap/" in lowered or "/runtime/homemap/" in lowered:
+        return "home_map"
+    if "/editor/export/" in lowered:
+        return "export"
+    if "/editor/sync/" in lowered:
+        return "sync"
+    if "/runtime/" in lowered:
+        return "runtime"
+    if "bridge" in lowered or "integration" in lowered or evidence_type == "related_reference":
+        return "bridge"
+    return "config"
+
+
+def compute_line_number(text: str, position: int) -> int:
+    return text.count("\n", 0, position) + 1
+
+
+def first_non_empty_line_number(text: str) -> int:
+    for index, line in enumerate(text.splitlines(), start=1):
+        if line.strip():
+            return index
+    return 1
+
+
+def format_module_label(task: dict[str, object]) -> str:
+    target_paths = task.get("targetPaths", [])
+    if isinstance(target_paths, list) and target_paths:
+        return ", ".join(str(path) for path in target_paths)
+    return "unknown-module"
 
 
 def render_responsibility_section(docs: list[EvidenceItem], directory_trees: list[EvidenceItem]) -> str:
@@ -696,13 +1369,16 @@ def render_handover_advice(
     docs: list[EvidenceItem],
     scripts: list[EvidenceItem],
     related_refs: list[EvidenceItem],
+    code_registry: dict[str, object],
 ) -> str:
     reading_order = []
     reading_order.extend(item.path for item in docs[:2])
+    reading_order.extend(extract_priority_code_paths(code_registry, limit=3))
     reading_order.extend(item.path for item in entrypoints[:2])
     reading_order.extend(item.path for item in configs[:2])
     reading_order.extend(item.path for item in scripts[:2])
     reading_order.extend(item.path for item in related_refs[:2])
+    reading_order = dedupe_keep_order(reading_order)
 
     if not reading_order:
         return "建议先确认模块负责人和运行环境，再人工补齐最小阅读路径。"
@@ -714,6 +1390,52 @@ def render_handover_advice(
         lines.append(f"{index}. `{path}`")
     lines.append("")
     lines.append("完成首轮阅读后，优先补齐 `open-questions.md` 中的人工信息。")
+    return "\n".join(lines)
+
+
+def render_code_evidence_section(code_registry: dict[str, object]) -> str:
+    items = code_registry.get("items", []) if isinstance(code_registry, dict) else []
+    if not items:
+        return "当前未生成稳定的代码级 evidence，建议优先人工补齐统一入口、会话宿主和导出/同步上下文这三类关键锚点。"
+
+    lines = [
+        "这一节列出自动提取出的关键代码锚点，用来把高层结论落到具体文件和符号上。",
+    ]
+    for item in items[:8]:
+        path = item.get("path", "unknown")
+        symbol = item.get("symbol", "unknown")
+        line_no = item.get("startLine", 1)
+        role = item.get("role", "关键代码锚点")
+        code_id = item.get("id", "code-unknown")
+        impacts = ", ".join(item.get("impacts", [])[:3]) if isinstance(item.get("impacts"), list) else ""
+        lines.append(f"- `{code_id}` `{path}:{line_no}` `{symbol}`")
+        lines.append(f"  作用：{role}")
+        if impacts:
+            lines.append(f"  影响面：{impacts}")
+    lines.append("")
+    lines.append("完整代码锚点列表见 `understanding/14-code-evidence-registry.json`。")
+    return "\n".join(lines)
+
+
+def render_change_impact_section(code_registry: dict[str, object]) -> str:
+    rows = build_change_impact_rows(code_registry.get("items", []) if isinstance(code_registry, dict) else [])
+    if not rows:
+        return "当前未自动识别出稳定的变更影响矩阵，建议至少先人工补齐“会话模型、路径命名、导出/同步上下文”三类高风险改动面。"
+
+    lines = [
+        "下面整理的是更贴近维护动作的“改动面 -> 影响 -> 回归”提示。",
+    ]
+    for row in rows[:4]:
+        locations = " / ".join(f"`{path}`" for path in row["locations"][:2])
+        code_refs = " ".join(f"`{code_id}`" for code_id in row["code_ids"][:4])
+        lines.append(f"- {row['change_surface']}")
+        lines.append(f"  典型位置：{locations}")
+        lines.append(f"  影响：{row['downstream']}")
+        lines.append(f"  必查：{row['contracts']}")
+        lines.append(f"  回归：{row['regressions']}")
+        lines.append(f"  代码锚点：{code_refs}")
+    lines.append("")
+    lines.append("完整变更矩阵见 `understanding/15-change-impact-matrix.md`。")
     return "\n".join(lines)
 
 

@@ -42,6 +42,12 @@ primaryEvidence: []
 - 再读：`12-confidence-report.md`
 - 回看证据：待填写
 
+## 想评估“改这里会波及什么”
+
+- 先读：`15-change-impact-matrix.md`
+- 再读：`14-code-evidence-registry.json`
+- 再补：`07-contract-registry.md`
+
 ## 想补作者问题
 
 - 先读：`11-unknowns-and-open-questions.md`

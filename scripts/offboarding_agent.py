@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -125,8 +126,32 @@ MAX_TEXT_FILE_SIZE = 256 * 1024
 MAX_EVIDENCE_SNIPPET_CHARS = 1200
 MAX_EVIDENCE_PER_TYPE = 20
 MAX_RELATED_REFERENCE_FILES = 12
-MAX_CODE_EVIDENCE_ITEMS = 18
+MAX_CODE_EVIDENCE_ITEMS = 28
 MAX_CODE_EVIDENCE_PER_FILE = 2
+MAX_CODE_EVIDENCE_PER_CATEGORY = 8
+
+PRIMARY_CODE_PATH_PATTERNS = [
+    "/editor/homemap/windows/homemapentrywindow.cs",
+    "/editor/windows/entrywindow.cs",
+    "/editor/scenemodel/scenesessionrequest.cs",
+    "/editor/sceneprofiles/sceneprofile.cs",
+    "/editor/sceneprofiles/homemapsceneprofile.cs",
+    "/editor/session/editorsession.cs",
+    "/editor/session/sceneoperationrouter.cs",
+    "/editor/session/scenemodulesetregistry.cs",
+    "/editor/session/scenemoduleset.cs",
+    "/editor/export/exportcontext.cs",
+    "/editor/export/exportpipeline.cs",
+    "/editor/export/exportstepregistry.cs",
+    "/editor/export/steps/exportsceneblueprintruntimedatastep.cs",
+    "/editor/export/steps/exportunifiednavdescriptorstep.cs",
+    "/editor/homemap/services/homemapruntimepackageexportservice.cs",
+    "/runtime/framesync/data/sceneblueprintruntimedata.cs",
+    "/runtime/homemap/data/homemapruntimepackagedata.cs",
+    "/runtime/homemap/data/unifiednavexportdescriptordata.cs",
+    "/editor/integration/stagedesignerintegration.cs",
+    "/editor/bridge/mapeditorbridge.cs",
+]
 
 
 @dataclass(frozen=True)
@@ -173,7 +198,10 @@ def parse_args() -> argparse.Namespace:
     run_parser.add_argument("--owner", default="Unknown", help="The current owner or departing engineer.")
     run_parser.add_argument("--audience", default="接手开发", help="Primary audience of the handover material.")
     run_parser.add_argument("--reviewer", default="", help="Optional reviewer name.")
-    run_parser.add_argument("--task-id", help="Optional custom task id.")
+    run_parser.add_argument(
+        "--task-id",
+        help="Deprecated compatibility argument. Output directory is now always derived from the target project name.",
+    )
     return parser.parse_args()
 
 
@@ -190,9 +218,12 @@ def run_workflow(args: argparse.Namespace) -> int:
         raise SystemExit(f"Target repository does not exist: {repo_path}")
 
     target_paths = [resolve_target_path(repo_path, value) for value in args.target]
-    task_id = args.task_id or build_task_id(target_paths)
+    task_id = build_task_id(target_paths)
+    cleanup_legacy_run_dirs(task_id)
     run_dir = RUNS_DIR / task_id
-    run_dir.mkdir(parents=True, exist_ok=False)
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     created_at = datetime.now().astimezone().isoformat(timespec="seconds")
     task = {
@@ -220,14 +251,14 @@ def run_workflow(args: argparse.Namespace) -> int:
     change_impact_matrix = render_change_impact_matrix(task, code_registry)
     (understanding_dir / "15-change-impact-matrix.md").write_text(change_impact_matrix, encoding="utf-8")
 
-    handover_markdown = render_handover(task, evidence, code_registry)
-    (run_dir / "handover.md").write_text(handover_markdown, encoding="utf-8")
-
     questions_markdown = render_open_questions(task, evidence)
-    (run_dir / "open-questions.md").write_text(questions_markdown, encoding="utf-8")
+    (understanding_dir / "open-questions.md").write_text(questions_markdown, encoding="utf-8")
 
     scan_summary_markdown = render_scan_summary(task, evidence)
-    (run_dir / "scan-summary.md").write_text(scan_summary_markdown, encoding="utf-8")
+    (understanding_dir / "scan-summary.md").write_text(scan_summary_markdown, encoding="utf-8")
+
+    handover_markdown = render_handover(task, evidence, understanding_dir)
+    (run_dir / "handover.md").write_text(handover_markdown, encoding="utf-8")
 
     task["status"] = "completed"
     task["updatedAt"] = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -237,11 +268,11 @@ def run_workflow(args: argparse.Namespace) -> int:
     print("Generated files:")
     print(f"  - {run_dir / 'task.json'}")
     print(f"  - {run_dir / 'evidence.json'}")
-    print(f"  - {run_dir / 'scan-summary.md'}")
     print(f"  - {run_dir / 'handover.md'}")
-    print(f"  - {run_dir / 'open-questions.md'}")
     print(f"  - {understanding_dir / '14-code-evidence-registry.json'}")
     print(f"  - {understanding_dir / '15-change-impact-matrix.md'}")
+    print(f"  - {understanding_dir / 'scan-summary.md'}")
+    print(f"  - {understanding_dir / 'open-questions.md'}")
     return 0
 
 
@@ -257,13 +288,37 @@ def resolve_target_path(repo_path: Path, raw_target: str) -> Path:
 
 
 def build_task_id(target_paths: list[Path]) -> str:
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     base_name = slugify(target_paths[0].name) or "task"
-    return f"{timestamp}-{base_name}"
+    return base_name
+
+
+def cleanup_legacy_run_dirs(task_id: str) -> None:
+    if not RUNS_DIR.exists():
+        return
+
+    runs_root = RUNS_DIR.resolve()
+    aliases = {task_id, task_id.replace("-", "")}
+    for candidate in RUNS_DIR.iterdir():
+        if not candidate.is_dir():
+            continue
+        if candidate.name == task_id:
+            continue
+        if not any(
+            candidate.name == alias or candidate.name.startswith(f"{alias}-")
+            for alias in aliases
+        ):
+            continue
+
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(runs_root):
+            raise SystemExit(f"Refusing to remove run directory outside runs root: {resolved}")
+        shutil.rmtree(resolved)
 
 
 def slugify(value: str) -> str:
-    normalized = value.strip().lower().replace(" ", "-")
+    normalized = value.strip()
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", normalized)
+    normalized = normalized.replace(" ", "-").lower()
     normalized = re.sub(r"[^a-z0-9._-]+", "-", normalized)
     normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
     return normalized
@@ -287,11 +342,38 @@ def collect_evidence(repo_path: Path, target_paths: list[Path]) -> list[Evidence
         )
         counter += 1
 
-    candidate_files = list(scan_candidate_files(repo_path, target_paths))
-    related_reference_files = list(find_related_reference_files(repo_path, target_paths))
+    candidate_files = sorted(
+        scan_candidate_files(repo_path, target_paths),
+        key=lambda path: (
+            candidate_file_priority_score(repo_path, target_paths, path),
+            to_posix(path.relative_to(repo_path)).lower(),
+        ),
+    )
+    related_reference_files = sorted(
+        find_related_reference_files(repo_path, target_paths),
+        key=lambda path: (
+            candidate_file_priority_score(repo_path, target_paths, path),
+            to_posix(path.relative_to(repo_path)).lower(),
+        ),
+    )
+    primary_candidate_files: list[Path] = []
+    for pattern in PRIMARY_CODE_PATH_PATTERNS:
+        for file_path in candidate_files:
+            if pattern in to_posix(file_path.relative_to(repo_path)).lower():
+                primary_candidate_files.append(file_path)
+                break
+
+    ordered_candidate_files: list[Path] = []
+    seen_candidate_paths: set[Path] = set()
+    for file_path in primary_candidate_files + candidate_files:
+        if file_path in seen_candidate_paths:
+            continue
+        seen_candidate_paths.add(file_path)
+        ordered_candidate_files.append(file_path)
+
     typed_counts: Counter[str] = Counter()
 
-    for file_path in candidate_files + related_reference_files:
+    for file_path in ordered_candidate_files + related_reference_files:
         evidence_type = classify_file(repo_path, target_paths, file_path)
         if not evidence_type:
             continue
@@ -310,6 +392,105 @@ def collect_evidence(repo_path: Path, target_paths: list[Path]) -> list[Evidence
         typed_counts[evidence_type] += 1
 
     return evidence
+
+
+def candidate_file_priority_score(repo_path: Path, target_paths: list[Path], file_path: Path) -> int:
+    evidence_type = classify_file(repo_path, target_paths, file_path)
+    if not evidence_type:
+        return 1000
+
+    relative_path = to_posix(file_path.relative_to(repo_path)).lower()
+    file_name = file_path.name.lower()
+    score = 100
+
+    top_signal_names = (
+        "scenesessionrequest",
+        "sceneprofile",
+        "homemapsceneprofile",
+        "levelsceneprofile",
+        "hubsceneprofile",
+        "battletestsceneprofile",
+        "editorsession",
+        "sceneoperationrouter",
+        "scenemodulesetregistry",
+        "scenemoduleset",
+        "exportcontext",
+        "exportpipeline",
+        "exportstepregistry",
+        "exportsceneblueprintruntimedatastep",
+        "exportunifiednavdescriptorstep",
+        "homemapruntimepackageexportservice",
+        "sceneblueprintruntimedata",
+        "homemapruntimepackagedata",
+        "unifiednavexportdescriptordata",
+    )
+    medium_signal_names = (
+        "request",
+        "profile",
+        "session",
+        "router",
+        "moduleset",
+        "runtimepackage",
+        "runtimedata",
+        "descriptor",
+        "pipeline",
+        "context",
+    )
+    low_signal_names = (
+        "datamanager",
+        "debugwindow",
+        "visualizer",
+        "actions",
+        "events",
+        "gui",
+        "preview",
+        "test",
+    )
+
+    if evidence_type == "doc":
+        if "离职交接" in file_path.name:
+            score -= 90
+        if "架构设计" in file_path.name:
+            score -= 80
+        if relative_path.endswith("design.md"):
+            score -= 60
+        if "readme" in file_name:
+            score -= 40
+        if "/specs/" in relative_path:
+            score -= 25
+        if "proposal" in file_name or "requirements" in file_name:
+            score -= 10
+        if "tasks" in file_name or "verification" in file_name or "性能" in file_path.name:
+            score += 20
+
+    if evidence_type in {"source", "entrypoint", "config", "script"}:
+        for name in top_signal_names:
+            if name in relative_path:
+                score -= 70
+        for name in medium_signal_names:
+            if name in relative_path:
+                score -= 25
+        for name in low_signal_names:
+            if name in relative_path:
+                score += 25
+
+    if evidence_type == "config":
+        if file_name.endswith(".asmdef"):
+            score -= 25
+        if file_name.endswith(".csproj") or file_name.endswith(".sln"):
+            score += 20
+
+    if evidence_type == "entrypoint":
+        if "entrywindow" in relative_path:
+            score -= 40
+        if "settingswindow" in relative_path or "prefabimportwindow" in relative_path:
+            score += 10
+
+    if evidence_type == "related_reference":
+        if "dungeonarchitect" in relative_path or "mapeditor" in relative_path:
+            score -= 20
+
+    return score
 
 
 def scan_candidate_files(repo_path: Path, target_paths: list[Path]) -> Iterable[Path]:
@@ -402,12 +583,32 @@ def looks_like_entrypoint(file_path: Path) -> bool:
     file_name = file_path.name.lower()
     suffix = file_path.suffix.lower()
     stem = file_path.stem.lower()
+    noisy_partial_suffixes = (
+        ".actions",
+        ".events",
+        ".gui",
+        ".compatibility",
+        ".governance",
+        ".legacyshell",
+        ".workbenchnarrative",
+        ".linkedsource",
+        ".logs",
+        ".templatebatch",
+        ".terrainexport",
+        ".validation",
+        ".advancedworkbench",
+        ".preview",
+    )
 
     if file_name in {"program.cs", "startup.cs"}:
         return True
     if suffix == ".unity" and stem in {"main", "entry"}:
         return True
     if suffix in {".cs", ".js", ".ts", ".tsx", ".jsx", ".py"} and stem in {"main", "index", "application", "entry", "bootstrap"}:
+        return True
+    if suffix == ".cs" and any(token in stem for token in noisy_partial_suffixes):
+        return False
+    if suffix == ".cs" and (stem.endswith("entrywindow") or stem == "entrywindow"):
         return True
     if suffix == ".cs" and ("window" in stem or "bootstrap" in stem or stem.startswith("entry")):
         return True
@@ -530,52 +731,329 @@ def make_evidence_item(
 def render_handover(
     task: dict[str, object],
     evidence: list[EvidenceItem],
-    code_registry: dict[str, object] | None = None,
+    understanding_dir: Path,
 ) -> str:
     template = load_template("handover.md.tpl")
-    target_paths = "\n".join(f"- `{path}`" for path in task["targetPaths"])
-    scope_notes = [
-        "当前版本只读扫描目标目录，不会在目标仓库内生成任何文件。",
-        f"本次输出目录固定在工具仓库的 `runs/{task['taskId']}`。",
-        "以下结论为基于现有代码与文档的初版整理，仍需结合作者经验补充。",
-    ]
 
-    docs = filter_evidence(evidence, "doc")
-    entrypoints = filter_evidence(evidence, "entrypoint")
-    configs = filter_evidence(evidence, "config")
+    code_registry = load_code_evidence_registry(understanding_dir)
+    change_rows = load_change_impact_rows(understanding_dir)
+
+    docs = sort_docs_for_handover(filter_evidence(evidence, "doc"))
+    configs = sort_configs_for_handover(filter_evidence(evidence, "config"), task)
     related_refs = filter_evidence(evidence, "related_reference")
-    scripts = filter_evidence(evidence, "script")
-    directory_trees = filter_evidence(evidence, "directory_tree")
 
-    responsibility_section = render_responsibility_section(docs, directory_trees)
-    entry_section = render_evidence_bullets(entrypoints, empty_message="未发现明显入口文件，建议优先从目录树与配置文件入手排查。")
-    dependency_section = render_dependency_section(configs, related_refs)
-    flow_section = render_flow_section(entrypoints, scripts, docs, related_refs)
-    code_evidence_section = render_code_evidence_section(code_registry or {})
-    change_impact_section = render_change_impact_section(code_registry or {})
-    risk_section = render_risk_section(task, evidence)
-    handover_section = render_handover_advice(entrypoints, configs, docs, scripts, related_refs, code_registry or {})
-    evidence_section = render_reference_section(evidence)
+    module_name = infer_module_name(task)
+    goal_section = render_goal_section(task)
+    main_chain_section = render_main_chain_section(code_registry)
+    summary_section = render_summary_section(code_registry, change_rows)
+    overview_section = render_overview_section(task, docs, code_registry)
+    session_chain_section = render_session_chain_section(code_registry)
+    runtime_chain_section = render_runtime_chain_section(code_registry)
+    boundary_section = render_boundary_section(configs, related_refs, code_registry)
+    verification_section = render_verification_section(change_rows, code_registry)
+    open_questions_section = render_open_questions_section(task, evidence)
+    reading_order_section = render_reading_order_section(docs, code_registry, related_refs)
+    reference_material_section = render_reference_material_section(docs, code_registry, related_refs)
 
     return template.substitute(
-        task_id=task["taskId"],
-        repo_path=task["repoPath"],
-        owner=task["owner"],
-        reviewer=task["reviewer"] or "未指定",
-        audience=task["audience"],
-        created_at=task["createdAt"],
-        target_paths=target_paths,
-        scope_notes="\n".join(f"- {note}" for note in scope_notes),
-        responsibility_section=responsibility_section,
-        entry_section=entry_section,
-        dependency_section=dependency_section,
-        flow_section=flow_section,
-        code_evidence_section=code_evidence_section,
-        change_impact_section=change_impact_section,
-        risk_section=risk_section,
-        handover_section=handover_section,
-        evidence_section=evidence_section,
+        module_name=module_name,
+        goal_section=goal_section,
+        main_chain_section=main_chain_section,
+        summary_section=summary_section,
+        overview_section=overview_section,
+        session_chain_section=session_chain_section,
+        runtime_chain_section=runtime_chain_section,
+        boundary_section=boundary_section,
+        verification_section=verification_section,
+        open_questions_section=open_questions_section,
+        reading_order_section=reading_order_section,
+        reference_material_section=reference_material_section,
     )
+
+
+def load_code_evidence_registry(understanding_dir: Path) -> dict[str, object]:
+    path = understanding_dir / "14-code-evidence-registry.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def load_change_impact_rows(understanding_dir: Path) -> list[dict[str, object]]:
+    path = understanding_dir / "15-change-impact-matrix.md"
+    if not path.exists():
+        return []
+    return parse_change_impact_rows(path.read_text(encoding="utf-8"))
+
+
+def parse_change_impact_rows(markdown: str) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    seen_header = False
+
+    for raw_line in markdown.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("|"):
+            continue
+        if "变更面" in line and "典型编辑位置" in line:
+            seen_header = True
+            continue
+        if not seen_header or line.startswith("| ---"):
+            continue
+
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) < 9:
+            continue
+
+        rows.append(
+            {
+                "change_surface": cells[0],
+                "locations": re.findall(r"`([^`]+)`", cells[1]),
+                "direct_layer": cells[2],
+                "downstream": cells[3],
+                "contracts": cells[4],
+                "regressions": cells[5],
+                "risk": cells[6],
+                "code_ids": re.findall(r"`([^`]+)`", cells[7]),
+                "evidence_ids": re.findall(r"`([^`]+)`", cells[8]),
+            }
+        )
+    return rows
+
+
+def infer_module_name(task: dict[str, object]) -> str:
+    target_paths = task.get("targetPaths", [])
+    if isinstance(target_paths, list) and target_paths:
+        return Path(str(target_paths[0])).name or "模块"
+    return "模块"
+
+
+def format_backticked_paths(paths: list[str], limit: int = 3, separator: str = "、") -> str:
+    values = [f"`{path}`" for path in dedupe_keep_order(paths)[:limit] if path]
+    return separator.join(values)
+
+
+def extract_paths_by_patterns(code_registry: dict[str, object], patterns: list[str], limit: int = 4) -> list[str]:
+    return dedupe_keep_order(
+        [str(item.get("path", "")) for item in find_code_items_by_path_patterns(code_registry, patterns, limit=limit) if item.get("path")]
+    )[:limit]
+
+
+def render_goal_section(task: dict[str, object]) -> str:
+    target_paths = task.get("targetPaths", [])
+    scope = "、".join(f"`{path}`" for path in target_paths) if isinstance(target_paths, list) else "`unknown`"
+    lines = [
+        f"这份文档用于离职交接，目标是把 {scope} 当前真实实现讲清楚。",
+        "本文只讲当前真实实现，不讲理想形态，也不假设接手人已经了解这套系统的历史背景。",
+        "接手同学读完后，应该能快速回答下面几个问题：",
+        "- StageDesigner 当前真实启动主链是什么。",
+        "- Session / Router / ModuleSet 在这套系统里分别承担什么职责。",
+        "- Export 是怎么把编辑态数据继续收敛到 Runtime 契约的。",
+        "- HomeMap 在统一宿主里处于什么位置，而不是被误解成完全独立系统。",
+        "- 后续如果继续改，应该先看哪些文件，哪些地方最容易引发连锁回归。",
+    ]
+    return "\n".join(lines)
+
+
+def render_main_chain_section(code_registry: dict[str, object]) -> str:
+    entry_names = "HomeMapEntryWindow / EntryWindow" if extract_paths_by_patterns(code_registry, ["homemapentrywindow", "/editor/windows/entrywindow.cs"], limit=2) else "入口窗口"
+    request_names = "SceneSessionRequest"
+    profile_names = "SceneProfile / HomeMapSceneProfile"
+    session_names = "EditorSession.StartSession(...)"
+    router_names = "SceneOperationRouter"
+    module_names = "SceneModuleSetRegistry / SceneModuleSet"
+    export_names = "ExportContext / ExportPipeline / ExportStepRegistry"
+    export_steps = "ExportSceneBlueprintRuntimeDataStep / ExportUnifiedNavDescriptorStep / HomeMapRuntimePackageExportService"
+    runtime_names = "SceneBlueprintRuntimeData / HomeMapRuntimePackageData / UnifiedNavExportDescriptorData"
+    return "\n".join(
+        [
+            "入口与启动",
+            f"  {entry_names}",
+            f"  -> {request_names}",
+            f"  -> {profile_names}",
+            f"  -> {session_names}",
+            "",
+            "会话与能力装配",
+            f"  -> {router_names}",
+            f"  -> {module_names}",
+            "",
+            "导出到运行时",
+            f"  -> {export_names}",
+            f"  -> {export_steps}",
+            f"  -> {runtime_names}",
+        ]
+    )
+
+
+def render_summary_section(code_registry: dict[str, object], change_rows: list[dict[str, object]]) -> str:
+    dangerous_surfaces = [row.get("change_surface", "") for row in change_rows[:3] if row.get("change_surface")]
+    lines = [
+        "- StageDesigner 当前真实启动主链已经统一到 `SceneSessionRequest + SceneProfile + EditorSession.StartSession(...)`，入口侧不应该再把 `level`、`homeMapId` 这类旧参数当成长期主语义。",
+        "- `SceneOperationRouter` 是整个系统的关键裁决点，它不只影响显示名，还影响 capability 判断、稳定场景标识、会话分流与后续导出行为。",
+        "- `SceneModuleSetRegistry / SceneModuleSet` 决定某类场景启动后到底装配哪些模块，是“新场景类型接入”和“能力收缩/扩展”的首要入口。",
+        "- 导出主链的宿主不是某一个单独 step，而是 `ExportContext / ExportPipeline / ExportStepRegistry`；具体步骤只是挂在这套宿主之上的执行单元。",
+        "- 运行时真正消费的落点是 `SceneBlueprintRuntimeData`、`HomeMapRuntimePackageData`、`UnifiedNavExportDescriptorData`，这三类数据契约比编辑器窗口本身更接近下游真实边界。",
+        "- HomeMap 不是完全独立的一套编辑器宿主，而是在统一会话主链上，通过 `HomeMapSceneProfile` 与 `HomeMapRuntimePackageExportService` 扩展出自己的专属工作流。",
+    ]
+    if dangerous_surfaces:
+        lines.append(f"- 当前最危险的几个改动面是：{'、'.join(dangerous_surfaces)}。")
+    return "\n".join(lines)
+
+
+def render_overview_section(task: dict[str, object], docs: list[EvidenceItem], code_registry: dict[str, object]) -> str:
+    lines = [
+        "从现有文档和代码可以把 StageDesigner 理解成一套“统一场景宿主 + 多场景类型接入 + 导出到运行时契约”的通用场景设计工具，而不只是一个单独窗口。",
+        "它的核心思路不是按功能点零散生长，而是先把场景抽象成统一请求与 profile，再通过会话、模块装配、导出和运行时契约把整条链路串起来。",
+        "",
+        "当前目录里最值得先建立认知的是：",
+        "- `Documentations~`：架构、演进和 HomeMap spec 文档，是理解背景和演进方向的第一入口。",
+        "- `Editor/SceneModel` 与 `Editor/SceneProfiles`：定义 `SceneIdentity / SceneProfile / SceneSessionRequest` 这组统一模型。",
+        "- `Editor/Session`：定义真实会话宿主、能力路由和模块装配，是主链中心。",
+        "- `Editor/Export`：定义导出上下文、流水线、步骤注册和具体 step。",
+        "- `Editor/HomeMap`：承载 HomeMap 的入口、恢复与 runtime package 导出。",
+        "- `Runtime/FrameSync` 与 `Runtime/HomeMap`：承载运行时最终消费的数据契约。",
+        "- `Editor/Integration` 与 `Editor/Bridge`：承载对外桥接和联调边界。",
+    ]
+    if docs:
+        lines.append("")
+        lines.append(f"背景文档建议先看 {format_backticked_paths([item.path for item in docs[:3]], limit=3)}。")
+    session_paths = extract_paths_by_patterns(code_registry, ["scenesessionrequest", "sceneprofile", "editorsession", "sceneoperationrouter"], limit=4)
+    if session_paths:
+        lines.append(f"如果只打算先抓主链，不要先扫全目录，优先抓住 {format_backticked_paths(session_paths, limit=4)}。")
+    return "\n".join(lines)
+
+
+def render_session_chain_section(code_registry: dict[str, object]) -> str:
+    entry_paths = extract_paths_by_patterns(code_registry, ["homemapentrywindow", "/editor/windows/entrywindow.cs"], limit=2)
+    model_paths = extract_paths_by_patterns(code_registry, ["scenesessionrequest", "/editor/sceneprofiles/sceneprofile.cs", "homemapsceneprofile"], limit=3)
+    session_paths = extract_paths_by_patterns(code_registry, ["editorsession", "sceneoperationrouter", "scenemodulesetregistry", "scenemoduleset"], limit=4)
+    lines = [
+        "StageDesigner 的统一会话主链可以按“入口构造请求 -> 会话宿主接管 -> 路由判定能力 -> 模块集合完成装配”来理解。",
+        "",
+        f"- 启动入口：{format_backticked_paths(entry_paths, limit=2)} 负责把用户选择和场景信息整理成统一请求，而不是直接把旧业务参数散到各处。",
+        f"- 请求模型：{format_backticked_paths(model_paths, limit=3)} 定义了 `SceneIdentity / SceneProfile / SceneSessionRequest` 这组统一数据模型，后续链路都围绕它工作。",
+        f"- 会话宿主：{format_backticked_paths(extract_paths_by_patterns(code_registry, ['editorsession'], limit=1), limit=1)} 中的 `StartSession(SceneSessionRequest request)` 是真实入口，负责参数校验、Redux 初始化、模块配置、事件注册与生命周期管理。",
+        f"- 路由裁决：{format_backticked_paths(extract_paths_by_patterns(code_registry, ['sceneoperationrouter'], limit=1), limit=1)} 负责 `SupportsCapability`、`GetStableSceneId`、`GetSceneDisplayName` 这类关键判断，是接手时最不能低估的一层。",
+        f"- 模块装配：{format_backticked_paths(extract_paths_by_patterns(code_registry, ['scenemodulesetregistry', 'scenemoduleset'], limit=2), limit=2)} 决定当前场景会真正装配哪些编辑模块，因此新场景类型接入首先要回到这里，而不是先改导出或 UI。",
+        "",
+        "这条链对接手人的意义是：以后看到任何新入口、新场景类型、新 capability，先问它有没有被正确包装成 `SceneSessionRequest`，有没有走进 `EditorSession.StartSession(...)`，有没有在 `SceneModuleSetRegistry` 里完成模块装配。",
+    ]
+    if session_paths:
+        lines.append(f"当前主链最核心的一组实现文件是：{format_backticked_paths(session_paths, limit=4)}。")
+    return "\n".join(lines)
+
+
+def render_runtime_chain_section(code_registry: dict[str, object]) -> str:
+    export_host_paths = extract_paths_by_patterns(code_registry, ["exportcontext", "exportpipeline", "exportstepregistry"], limit=3)
+    export_step_paths = extract_paths_by_patterns(code_registry, ["exportsceneblueprintruntimedata", "exportunifiednavdescriptor", "runtimepackageexportservice"], limit=3)
+    runtime_paths = extract_paths_by_patterns(
+        code_registry,
+        [
+            "/runtime/framesync/data/sceneblueprintruntimedata.cs",
+            "/runtime/homemap/data/homemapruntimepackagedata.cs",
+            "/runtime/homemap/data/unifiednavexportdescriptordata.cs",
+        ],
+        limit=3,
+    )
+    lines = [
+        "导出到运行时的这条链，不应该被理解成“点一下导出按钮，某个工具类写文件”。更准确的理解是：先建立导出上下文，再由流水线和步骤注册器安排具体步骤，最后把数据收敛成运行时消费的契约。",
+        "",
+        f"- 导出宿主：{format_backticked_paths(export_host_paths, limit=3)} 负责从当前会话提取 `SceneIdentity / SceneProfile / CurrentSceneRequest`，构建执行计划，并按顺序调度步骤。",
+        f"- 关键步骤：{format_backticked_paths(export_step_paths, limit=3)} 负责把场景蓝图、统一导航描述和 HomeMap runtime package 等具体产物写出来。",
+        f"- 运行时落点：{format_backticked_paths(runtime_paths, limit=3)} 才是下游真正消费的契约。接手时要把它们当成运行时边界，而不是普通 editor data class。",
+        "",
+        "这条链最容易被误改的地方，是只盯着某一个 `ExportStep` 排查问题，而没有回头确认 `ExportContext` 提供的数据、`ExportPipeline` 的执行计划，以及 `ExportStepRegistry` 的注册顺序是否已经变了。",
+        "如果 HomeMap 导出出问题，也不要只看 `HomeMapRuntimePackageExportService`，还要一起确认统一导航描述、蓝图运行时数据和最终 runtime package 三类产物是否同时保持一致。",
+    ]
+    return "\n".join(lines)
+
+
+def render_boundary_section(
+    configs: list[EvidenceItem],
+    related_refs: list[EvidenceItem],
+    code_registry: dict[str, object],
+) -> str:
+    lines = [
+        "- 新入口或新场景类型接入时，不要重新把 `int level`、`string homeMapId` 之类旧参数当成主语义，应该先包装成 `SceneSessionRequest`。",
+        "- 新逻辑不要绕开 `EditorSession.StartSession(...)` 自己拼一套局部初始化；否则 Redux、模块初始化和事件注册很容易出现缺口。",
+        "- 改 `SceneOperationRouter` 时，不只是 UI 名称会变，`capability` 判断、稳定场景标识、导出分流和恢复逻辑都可能一起被波及。",
+        "- 改 `SceneModuleSetRegistry / SceneModuleSet` 时，要同时确认模块集合和初始化顺序，而不是只看某个模块类本身。",
+        "- 改导出逻辑时，不要只盯单个 `ExportStep`，至少要连带检查 `ExportContext`、`ExportPipeline`、`ExportStepRegistry`。",
+        "- 改 `SceneBlueprintRuntimeData`、`HomeMapRuntimePackageData`、`UnifiedNavExportDescriptorData` 时，要按运行时契约变更处理，而不是按普通编辑器模型处理。",
+    ]
+    if configs:
+        lines.append(f"- 程序集和配置边界主要落在 {format_backticked_paths([item.path for item in configs], limit=3)}，这部分改动往往会引起编译边界或目录约束变化。")
+    if related_refs:
+        lines.append(f"- StageDesigner 与仓库内其他模块存在真实耦合，当前至少已经扫到 {format_backticked_paths([item.path for item in related_refs], limit=3)} 这类外部引用，联调边界不能省略。")
+    bridge_paths = extract_paths_by_patterns(code_registry, ["stagedesignerintegration", "mapeditorbridge"], limit=2)
+    if bridge_paths:
+        lines.append(f"- 对外桥接主要集中在 {format_backticked_paths(bridge_paths, limit=2)}，这些位置的改动要明确谁是主导方、谁负责回归。")
+    return "\n".join(lines)
+
+
+def render_verification_section(change_rows: list[dict[str, object]], code_registry: dict[str, object]) -> str:
+    lines = [
+        "1. 入口相关改动后，`HomeMapEntryWindow` 与 `EntryWindow` 都要能正确构造 `SceneSessionRequest`，并且顺利进入 `EditorSession.StartSession(...)`。",
+        "2. `SceneProfile / SceneOperationRouter / SceneModuleSetRegistry` 改动后，要确认场景显示名、稳定场景标识、capability 判断和模块装配结果都没有回归。",
+        "3. 导出链改动后，要确认 `ExportContext -> ExportPipeline -> ExportStepRegistry` 这条宿主链仍然成立，不是只让单个 step 看起来能跑。",
+        "4. `ExportSceneBlueprintRuntimeDataStep`、`ExportUnifiedNavDescriptorStep`、`HomeMapRuntimePackageExportService` 改动后，要一起检查产物路径、产物内容和步骤顺序。",
+        "5. 运行时契约改动后，要确认 `SceneBlueprintRuntimeData`、`HomeMapRuntimePackageData`、`UnifiedNavExportDescriptorData` 的下游消费没有被破坏。",
+        "6. `Integration / Bridge` 改动后，要补一轮与外部模块的联调验证，而不是只看 StageDesigner 自己目录内是否编译通过。",
+    ]
+    if change_rows:
+        top_rows = "、".join(str(row.get("change_surface", "")) for row in change_rows[:3] if row.get("change_surface"))
+        if top_rows:
+            lines.append(f"7. 当前优先级最高的几类回归面是：{top_rows}。")
+    return "\n".join(lines)
+
+
+def render_reading_order_section(
+    docs: list[EvidenceItem],
+    code_registry: dict[str, object],
+    related_refs: list[EvidenceItem],
+) -> str:
+    doc_paths = [item.path for item in docs[:3]]
+    entry_paths = extract_paths_by_patterns(code_registry, ["homemapentrywindow", "/editor/windows/entrywindow.cs", "scenesessionrequest", "/editor/sceneprofiles/sceneprofile.cs", "homemapsceneprofile"], limit=5)
+    session_paths = extract_paths_by_patterns(code_registry, ["editorsession", "sceneoperationrouter", "scenemodulesetregistry", "scenemoduleset"], limit=4)
+    export_paths = extract_paths_by_patterns(code_registry, ["exportcontext", "exportpipeline", "exportstepregistry", "exportsceneblueprintruntimedata", "exportunifiednavdescriptor", "runtimepackageexportservice"], limit=6)
+    runtime_paths = extract_paths_by_patterns(
+        code_registry,
+        [
+            "/runtime/framesync/data/sceneblueprintruntimedata.cs",
+            "/runtime/homemap/data/homemapruntimepackagedata.cs",
+            "/runtime/homemap/data/unifiednavexportdescriptordata.cs",
+            "stagedesignerintegration",
+            "mapeditorbridge",
+        ],
+        limit=5,
+    )
+
+    lines = [
+        f"1. 先看背景文档：{format_backticked_paths(doc_paths, limit=3)}。",
+        f"2. 再看启动入口与请求模型：{format_backticked_paths(entry_paths, limit=5)}。",
+        f"3. 再看会话宿主与能力装配：{format_backticked_paths(session_paths, limit=4)}。",
+        f"4. 再看导出主链：{format_backticked_paths(export_paths, limit=6)}。",
+        f"5. 最后看运行时契约与对外桥接：{format_backticked_paths(runtime_paths, limit=5)}。",
+    ]
+    if related_refs:
+        lines.append(f"6. 如果后续需要联调，再回看外部引用：{format_backticked_paths([item.path for item in related_refs], limit=3)}。")
+    return "\n".join(lines)
+
+
+def render_reference_material_section(
+    docs: list[EvidenceItem],
+    code_registry: dict[str, object],
+    related_refs: list[EvidenceItem],
+) -> str:
+    references = []
+    for item in docs[:4]:
+        references.append(f"- `{item.path}`")
+    for path in extract_priority_code_paths(code_registry, limit=8):
+        references.append(f"- `{path}`")
+    for item in related_refs[:2]:
+        references.append(f"- `{item.path}`")
+    return "\n".join(dedupe_keep_order(references))
 
 
 def render_open_questions(task: dict[str, object], evidence: list[EvidenceItem]) -> str:
@@ -625,10 +1103,12 @@ def build_code_evidence_registry(
         if item.type not in priority:
             continue
         file_path = repo_path / item.path
+        if should_skip_code_registry_file(file_path):
+            continue
         if file_path.exists() and file_path.is_file():
             candidates.append((priority[item.type], item, file_path))
 
-    items: list[dict[str, object]] = []
+    all_anchors: list[dict[str, object]] = []
     seen_keys: set[tuple[str, str, int]] = set()
 
     for _, evidence_item, file_path in sorted(
@@ -638,18 +1118,61 @@ def build_code_evidence_registry(
             part[1].path.lower(),
         ),
     ):
-        if len(items) >= MAX_CODE_EVIDENCE_ITEMS:
-            break
-
         for anchor in extract_code_anchors(repo_path, target_paths, file_path, evidence_item):
             key = (str(anchor["path"]), str(anchor["symbol"]), int(anchor["startLine"]))
             if key in seen_keys:
                 continue
             seen_keys.add(key)
-            anchor["id"] = f"code-{len(items) + 1:03d}"
-            items.append(anchor)
-            if len(items) >= MAX_CODE_EVIDENCE_ITEMS:
+            all_anchors.append(anchor)
+
+    items: list[dict[str, object]] = []
+    category_counts: Counter[str] = Counter()
+    selected_keys: set[tuple[str, str, int]] = set()
+
+    def try_append(anchor: dict[str, object]) -> bool:
+        if is_noise_code_anchor(anchor):
+            return False
+        category = infer_change_surface_category(anchor)
+        key = (str(anchor["path"]), str(anchor["symbol"]), int(anchor["startLine"]))
+        if key in selected_keys:
+            return False
+        if category_counts[category] >= MAX_CODE_EVIDENCE_PER_CATEGORY:
+            return False
+        if len(items) >= MAX_CODE_EVIDENCE_ITEMS:
+            return False
+        selected_keys.add(key)
+        category_counts[category] += 1
+        items.append(anchor)
+        return True
+
+    for pattern in PRIMARY_CODE_PATH_PATTERNS:
+        matched = [
+            anchor
+            for anchor in all_anchors
+            if pattern in str(anchor.get("path", "")).lower()
+        ]
+        for anchor in sorted(
+            matched,
+            key=lambda item: (
+                code_anchor_priority_score(item),
+                str(item.get("path", "")).lower(),
+                int(item.get("startLine", 1)),
+            ),
+        ):
+            if try_append(anchor):
                 break
+
+    preferred_categories = ["entrypoint", "session", "home_map", "export", "sync", "runtime", "bridge"]
+    for category in preferred_categories:
+        for anchor in all_anchors:
+            if infer_change_surface_category(anchor) == category and try_append(anchor):
+                break
+
+    for anchor in all_anchors:
+        try_append(anchor)
+
+    for index, anchor in enumerate(items, start=1):
+        anchor["id"] = f"code-{index:03d}"
 
     return {
         "meta": {
@@ -660,6 +1183,77 @@ def build_code_evidence_registry(
         },
         "items": items,
     }
+
+
+def should_skip_code_registry_file(file_path: Path) -> bool:
+    lowered = file_path.name.lower()
+    return lowered.endswith(".sln") or lowered.endswith(".csproj")
+
+
+def is_noise_code_anchor(anchor: dict[str, object]) -> bool:
+    path = str(anchor.get("path", "")).lower()
+    symbol = str(anchor.get("symbol", ""))
+    if path.endswith(".sln") or path.endswith(".csproj"):
+        return True
+    if symbol.startswith("GUID:"):
+        return True
+    return False
+
+
+def code_anchor_priority_score(anchor: dict[str, object]) -> int:
+    path = str(anchor.get("path", "")).lower()
+    symbol = str(anchor.get("symbol", ""))
+    symbol_lower = symbol.lower()
+    kind = str(anchor.get("kind", ""))
+
+    score = 100
+    if kind == "type":
+        score -= 50
+    elif kind == "method":
+        score -= 20
+    elif kind == "config":
+        score += 10
+
+    preferred_methods = {
+        "startsession": -100,
+        "showswindow": -30,
+        "showwindow": -30,
+        "tryresolve": -70,
+        "initialize": -60,
+        "create": -40,
+        "buildexecutionplan": -70,
+        "executeall": -60,
+        "execute": -40,
+        "exportruntimepackage": -80,
+        "validatebasic": -50,
+        "normalizecontractfields": -45,
+        "getscenedisplayname": -55,
+        "getstablesceneid": -55,
+        "supportscapability": -55,
+        "getoutputpath": -35,
+    }
+    score += preferred_methods.get(symbol_lower, 0)
+
+    if path.endswith("/editor/session/editorsession.cs") and symbol == "StartSession":
+        score -= 120
+    if path.endswith("/editor/session/sceneoperationrouter.cs") and symbol in {"SupportsCapability", "GetStableSceneId", "GetSceneDisplayName"}:
+        score -= 100
+    if path.endswith("/editor/session/scenemodulesetregistry.cs") and symbol == "TryResolve":
+        score -= 90
+    if path.endswith("/runtime/framesync/data/sceneblueprintruntimedata.cs") and kind == "type":
+        score -= 80
+    if path.endswith("/runtime/homemap/data/homemapruntimepackagedata.cs") and kind == "type":
+        score -= 100
+    if path.endswith("/runtime/homemap/data/unifiednavexportdescriptordata.cs") and kind == "type":
+        score -= 100
+    if path.endswith("/editor/export/exportpipeline.cs") and symbol in {"BuildExecutionPlan", "ExecuteAll"}:
+        score -= 100
+    if path.endswith("/editor/export/steps/exportsceneblueprintruntimedatastep.cs") and symbol == "Execute":
+        score -= 90
+    if path.endswith("/editor/homemap/services/homemapruntimepackageexportservice.cs") and symbol == "ExportRuntimePackage":
+        score -= 100
+
+    return score
 
 
 def extract_code_anchors(
@@ -722,7 +1316,13 @@ def extract_symbol_anchors(
     if not matches:
         return extract_file_level_anchor(relative_path, text, evidence_item, inside_target, category)
 
-    for position, kind, name in sorted(matches, key=lambda part: part[0])[:MAX_CODE_EVIDENCE_PER_FILE]:
+    for position, kind, name in sorted(
+        matches,
+        key=lambda part: (
+            score_symbol_anchor(relative_path, part[1], part[2]),
+            part[0],
+        ),
+    )[:MAX_CODE_EVIDENCE_PER_FILE]:
         line_no = compute_line_number(text, position)
         anchors.append(
             make_code_anchor(
@@ -738,6 +1338,57 @@ def extract_symbol_anchors(
     return anchors
 
 
+def score_symbol_anchor(relative_path: str, kind: str, symbol_name: str) -> int:
+    score = 100
+    symbol_lower = symbol_name.lower()
+    path = relative_path.lower()
+
+    if kind == "type":
+        score -= 50
+    elif kind == "method":
+        score -= 10
+
+    preferred_methods = {
+        "startsession": -100,
+        "tryresolve": -75,
+        "initialize": -60,
+        "create": -40,
+        "buildexecutionplan": -70,
+        "executeall": -60,
+        "execute": -40,
+        "exportruntimepackage": -85,
+        "supportscapability": -55,
+        "getstablesceneid": -55,
+        "getscenedisplayname": -55,
+        "validatebasic": -50,
+        "normalizecontractfields": -45,
+        "getoutputpath": -35,
+        "showwindow": -25,
+    }
+    score += preferred_methods.get(symbol_lower, 0)
+
+    if path.endswith("/editor/session/editorsession.cs") and symbol_name == "StartSession":
+        score -= 130
+    if path.endswith("/editor/session/sceneoperationrouter.cs") and symbol_name in {"SupportsCapability", "GetStableSceneId", "GetSceneDisplayName"}:
+        score -= 100
+    if path.endswith("/editor/session/scenemodulesetregistry.cs") and symbol_name == "TryResolve":
+        score -= 90
+    if path.endswith("/runtime/framesync/data/sceneblueprintruntimedata.cs") and kind == "type":
+        score -= 80
+    if path.endswith("/runtime/homemap/data/homemapruntimepackagedata.cs") and kind == "type":
+        score -= 100
+    if path.endswith("/runtime/homemap/data/unifiednavexportdescriptordata.cs") and kind == "type":
+        score -= 100
+    if path.endswith("/editor/export/exportpipeline.cs") and symbol_name in {"BuildExecutionPlan", "ExecuteAll"}:
+        score -= 100
+    if path.endswith("/editor/export/steps/exportsceneblueprintruntimedatastep.cs") and symbol_name == "Execute":
+        score -= 100
+    if path.endswith("/editor/homemap/services/homemapruntimepackageexportservice.cs") and symbol_name == "ExportRuntimePackage":
+        score -= 100
+
+    return score
+
+
 def extract_config_anchors(
     relative_path: str,
     text: str,
@@ -747,15 +1398,22 @@ def extract_config_anchors(
 ) -> list[dict[str, object]]:
     patterns = [
         re.compile(r'"name"\s*:\s*"([^"]+)"'),
-        re.compile(r'"noEngineReferences"\s*:\s*(true|false)', re.IGNORECASE),
+        re.compile(r'"references"\s*:\s*\[\s*"([^"]+)"'),
+        re.compile(r'"rootNamespace"\s*:\s*"([^"]+)"'),
         re.compile(r"Project\(.*?\)\s*=\s*\"([^\"]+)\""),
         re.compile(r"<PackageReference[^>]+Include=\"([^\"]+)\"", re.IGNORECASE),
     ]
     anchors: list[dict[str, object]] = []
+    seen_labels: set[str] = set()
 
     for pattern in patterns:
         for match in pattern.finditer(text):
             label = match.group(1)
+            if not label or label.lower() in {"true", "false"} or label in seen_labels:
+                continue
+            if label.startswith("GUID:"):
+                continue
+            seen_labels.add(label)
             line_no = compute_line_number(text, match.start())
             anchors.append(
                 make_code_anchor(
@@ -1015,7 +1673,7 @@ def build_change_impact_rows(code_items: list[dict[str, object]]) -> list[dict[s
         if not matched:
             continue
 
-        locations = sorted({str(item["path"]) for item in matched})[:3]
+        locations = dedupe_keep_order([str(item["path"]) for item in matched])[:3]
         code_ids = [str(item["id"]) for item in matched[:6]]
         evidence_ids = sorted(
             {
@@ -1087,16 +1745,30 @@ def infer_change_surface_category(code_item: dict[str, object]) -> str:
     path = str(code_item.get("path", "")).lower()
     if "/editor/windows/" in path or "/editor/homemap/windows/" in path:
         return "entrypoint"
-    if "/editor/session/" in path:
+    if (
+        "/runtime/" in path
+        or "homemapruntimepackagedata" in path
+        or "unifiednavexportdescriptordata" in path
+        or "sceneblueprintruntimedata" in path
+    ):
+        return "runtime"
+    if (
+        "/editor/session/" in path
+        or "/editor/scenemodel/" in path
+        or "/editor/sceneprofiles/" in path
+    ):
         return "session"
     if "/editor/homemap/" in path or "/runtime/homemap/" in path:
         return "home_map"
-    if "/editor/export/" in path:
+    if (
+        "/editor/export/" in path
+        or "runtimepackageexportservice" in path
+        or "exportsceneblueprintruntimedatastep" in path
+        or "exportunifiednavdescriptorstep" in path
+    ):
         return "export"
     if "/editor/sync/" in path:
         return "sync"
-    if "/runtime/" in path:
-        return "runtime"
     if "bridge" in path or "integration" in path or code_item.get("scope") == "outside_target_consumer":
         return "bridge"
     return "config"
@@ -1105,16 +1777,30 @@ def infer_change_surface_category(code_item: dict[str, object]) -> str:
 def compute_code_candidate_score(evidence_item: EvidenceItem) -> int:
     path = evidence_item.path.lower()
     high_signal_names = {
+        "scenesessionrequest",
+        "sceneprofile",
         "entrywindow",
         "editorsession",
         "sceneoperationrouter",
+        "sceneassetpathrouter",
+        "sceneartifactsemanticnaming",
+        "scenemoduleset",
+        "scenemodulesetregistry",
         "homemapsceneprofile",
         "homemapmodulesetregistration",
         "homemapmodule",
+        "homemapruntimepackageexportservice",
+        "homemapruntimepackagedata",
         "exportcontext",
         "synccontext",
         "exportpipeline",
+        "exportstepregistry",
+        "exportsceneblueprintruntimedatastep",
+        "exportunifiednavdescriptorstep",
         "syncpipeline",
+        "stagedesignersettings",
+        "unifiednavexportdescriptordata",
+        "sceneblueprintruntimedata",
         "runtimepackageexportservice",
         "framesync",
         "bootstrap",
@@ -1158,7 +1844,18 @@ def extract_priority_code_paths(code_registry: dict[str, object], limit: int = 3
     items = code_registry.get("items", [])
     if not isinstance(items, list):
         return []
-    paths = [str(item.get("path", "")) for item in items if item.get("path")]
+    ordered_items = sorted(
+        items,
+        key=lambda item: (
+            min(
+                (index for index, pattern in enumerate(PRIMARY_CODE_PATH_PATTERNS) if pattern in str(item.get("path", "")).lower()),
+                default=len(PRIMARY_CODE_PATH_PATTERNS),
+            ),
+            str(item.get("path", "")).lower(),
+            int(item.get("startLine", 1)),
+        ),
+    )
+    paths = [str(item.get("path", "")) for item in ordered_items if item.get("path")]
     return dedupe_keep_order(paths)[:limit]
 
 
@@ -1208,18 +1905,24 @@ def is_high_signal_symbol(symbol_name: str, relative_path: str, evidence_type: s
     )
     high_signal_keywords = (
         "Session",
+        "Request",
+        "Identity",
         "Profile",
         "Module",
+        "Registry",
         "Pipeline",
         "Context",
         "Router",
         "Window",
         "Bridge",
         "Service",
+        "Package",
+        "Descriptor",
         "Bootstrap",
     )
     return symbol_name.startswith(high_signal_prefixes) or any(keyword in symbol_name for keyword in high_signal_keywords) or any(
-        keyword.lower() in relative_path.lower() for keyword in ("session", "pipeline", "router", "profile", "module", "bridge")
+        keyword.lower() in relative_path.lower()
+        for keyword in ("session", "request", "pipeline", "router", "profile", "module", "bridge", "runtime", "descriptor")
     )
 
 
@@ -1227,16 +1930,33 @@ def categorize_code_path(relative_path: str, evidence_type: str) -> str:
     lowered = relative_path.lower()
     if evidence_type == "entrypoint" or "/editor/windows/" in lowered:
         return "entrypoint"
-    if "/editor/session/" in lowered:
+    if (
+        "/runtime/" in lowered
+        or "stagedesignersettings.asset" in lowered
+        or "homemapruntimepackagedata" in lowered
+        or "unifiednavexportdescriptordata" in lowered
+        or "sceneblueprintruntimedata" in lowered
+    ):
+        return "runtime"
+    if (
+        "/editor/session/" in lowered
+        or "/editor/mode/" in lowered
+        or "/editor/scenemodel/" in lowered
+        or "/editor/sceneprofiles/" in lowered
+    ):
         return "session"
     if "/editor/homemap/" in lowered or "/runtime/homemap/" in lowered:
         return "home_map"
-    if "/editor/export/" in lowered:
+    if (
+        "/editor/export/" in lowered
+        or "/editor/pipeline/" in lowered
+        or "runtimepackageexportservice" in lowered
+        or "exportsceneblueprintruntimedatastep" in lowered
+        or "exportunifiednavdescriptorstep" in lowered
+    ):
         return "export"
-    if "/editor/sync/" in lowered:
+    if "/editor/sync/" in lowered or "syncconfig" in lowered:
         return "sync"
-    if "/runtime/" in lowered:
-        return "runtime"
     if "bridge" in lowered or "integration" in lowered or evidence_type == "related_reference":
         return "bridge"
     return "config"
@@ -1260,6 +1980,95 @@ def format_module_label(task: dict[str, object]) -> str:
     return "unknown-module"
 
 
+def sort_docs_for_handover(docs: list[EvidenceItem]) -> list[EvidenceItem]:
+    def score(item: EvidenceItem) -> tuple[int, str]:
+        path = item.path.lower()
+        value = 100
+        if "离职交接" in item.path or "handover" in path:
+            value -= 70
+        if "架构设计" in item.path or "architecture" in path:
+            value -= 60
+        if path.endswith("design.md"):
+            value -= 40
+        if "readme" in path:
+            value -= 35
+        if "/specs/" in path:
+            value -= 25
+        if "演进方案" in item.path or "proposal" in path or "requirements" in path:
+            value -= 15
+        if "问题记录" in item.path or "verification" in path or "tasks.md" in path:
+            value += 10
+        if "性能" in item.path:
+            value += 20
+        return (value, path)
+
+    return sorted(docs, key=score)
+
+
+def sort_configs_for_handover(configs: list[EvidenceItem], task: dict[str, object]) -> list[EvidenceItem]:
+    target_paths = [str(path).lower() for path in task.get("targetPaths", []) if isinstance(path, str)]
+
+    def score(item: EvidenceItem) -> tuple[int, str]:
+        path = item.path.lower()
+        value = 100
+        if any(path.startswith(prefix.lower()) for prefix in target_paths):
+            value -= 50
+        if path.endswith(".asmdef"):
+            value -= 35
+        if "stagedesigner" in path:
+            value -= 25
+        if path.endswith(".sln"):
+            value += 20
+        if path.endswith(".csproj"):
+            value += 30
+        return (value, path)
+
+    return sorted(configs, key=score)
+
+
+def get_code_items(code_registry: dict[str, object]) -> list[dict[str, object]]:
+    if not isinstance(code_registry, dict):
+        return []
+    items = code_registry.get("items", [])
+    return items if isinstance(items, list) else []
+
+
+def get_code_items_by_category(code_registry: dict[str, object], category: str, limit: int = 4) -> list[dict[str, object]]:
+    matched = [item for item in get_code_items(code_registry) if infer_change_surface_category(item) == category]
+    return matched[:limit]
+
+
+def find_code_items_by_path_patterns(
+    code_registry: dict[str, object],
+    patterns: list[str],
+    limit: int = 3,
+) -> list[dict[str, object]]:
+    matched: list[dict[str, object]] = []
+    seen_keys: set[tuple[str, str, int]] = set()
+    lowered_patterns = [pattern.lower() for pattern in patterns]
+
+    for item in get_code_items(code_registry):
+        path = str(item.get("path", "")).lower()
+        if not any(pattern in path for pattern in lowered_patterns):
+            continue
+        key = (str(item.get("path", "")), str(item.get("symbol", "")), int(item.get("startLine", 1)))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        matched.append(item)
+        if len(matched) >= limit:
+            break
+
+    return matched
+
+
+def render_code_anchor_refs(items: list[dict[str, object]], limit: int = 3) -> str:
+    refs = []
+    for item in items[:limit]:
+        refs.append(f"`{item.get('id', 'code-unknown')}` `{item.get('path', 'unknown')}:{item.get('startLine', 1)}`")
+    return " / ".join(refs)
+
+
 def render_responsibility_section(docs: list[EvidenceItem], directory_trees: list[EvidenceItem]) -> str:
     lines = [
         "当前版本优先依据已有文档与目录结构推断模块职责，建议后续由离职人补充业务目标、上下游关系和非代码约束。",
@@ -1280,6 +2089,54 @@ def render_responsibility_section(docs: list[EvidenceItem], directory_trees: lis
     return "\n".join(lines)
 
 
+def render_scan_overview_section(task: dict[str, object], evidence: list[EvidenceItem]) -> str:
+    type_counter = Counter(item.type for item in evidence)
+    target_paths = task.get("targetPaths", [])
+    lines = [
+        f"本次整合文档面向 `{', '.join(str(path) for path in target_paths)}`，以下是内部扫描层提取到的核心事实概况。",
+        f"- 目录结构证据：{type_counter.get('directory_tree', 0)} 条",
+        f"- 文档证据：{type_counter.get('doc', 0)} 条",
+        f"- 配置证据：{type_counter.get('config', 0)} 条",
+        f"- 入口证据：{type_counter.get('entrypoint', 0)} 条",
+        f"- 外部引用证据：{type_counter.get('related_reference', 0)} 条",
+        f"- 源码样本：{type_counter.get('source', 0)} 条",
+    ]
+    if type_counter.get("related_reference", 0):
+        lines.append("- 扫描结果表明该模块与仓库其他模块存在真实耦合，交接时不能只看目标目录内部代码。")
+    if not type_counter.get("doc", 0):
+        lines.append("- 当前范围几乎没有现成文档，自动 handover 的可信度会显著依赖代码锚点质量。")
+    return "\n".join(lines)
+
+
+def render_document_index_section(
+    docs: list[EvidenceItem],
+    code_registry: dict[str, object],
+    change_rows: list[dict[str, object]],
+) -> str:
+    if not docs and not get_code_items(code_registry):
+        return "当前未形成稳定的文档主索引，建议先人工补齐高层设计文档与关键入口文件。"
+
+    lines = [
+        "这部分用于把“应该先看什么”整合成一条连续阅读主线，避免接手人来回切十几份文档。",
+    ]
+    if docs:
+        lines.append("建议优先阅读以下已有文档：")
+        for item in docs[:5]:
+            lines.append(f"- `{item.path}`")
+    priority_code_paths = extract_priority_code_paths(code_registry, limit=18)
+    if priority_code_paths:
+        lines.append("")
+        lines.append("需要与文档并行联读的核心代码路径：")
+        for path in priority_code_paths:
+            lines.append(f"- `{path}`")
+    if change_rows:
+        lines.append("")
+        lines.append("阅读时优先关注以下高风险改动面：")
+        for row in sorted(change_rows, key=lambda item: 0 if item.get("risk") == "high" else 1)[:3]:
+            lines.append(f"- {row.get('change_surface', '未知变更面')}")
+    return "\n".join(lines)
+
+
 def render_evidence_bullets(items: list[EvidenceItem], empty_message: str) -> str:
     if not items:
         return empty_message
@@ -1290,20 +2147,105 @@ def render_evidence_bullets(items: list[EvidenceItem], empty_message: str) -> st
     return "\n".join(lines)
 
 
-def render_dependency_section(configs: list[EvidenceItem], related_refs: list[EvidenceItem]) -> str:
-    if not configs and not related_refs:
+def render_architecture_section(code_registry: dict[str, object], docs: list[EvidenceItem]) -> str:
+    definitions = [
+        (
+            "入口受理层",
+            "入口窗口负责收集用户输入，并把 level / hub / homeMap 等启动意图统一包装成会话请求。",
+            ["homemapentrywindow", "/editor/windows/entrywindow.cs"],
+            3,
+        ),
+        (
+            "统一请求建模层",
+            "SceneIdentity / SceneProfile / SceneSessionRequest 共同定义场景身份、能力和启动语义，是整个主链的上游数据模型。",
+            ["scenesessionrequest", "/editor/sceneprofiles/sceneprofile.cs", "homemapsceneprofile"],
+            4,
+        ),
+        (
+            "会话宿主与能力路由层",
+            "EditorSession 持有真实生命周期，SceneOperationRouter 负责 capability、稳定场景标识与展示名判断。",
+            ["editorsession", "sceneoperationrouter"],
+            4,
+        ),
+        (
+            "模块装配层",
+            "SceneModuleSetRegistry / SceneModuleSet 根据 SceneProfile 装配模块集合，决定会话启动后真正会初始化哪些能力。",
+            ["scenemodulesetregistry", "scenemoduleset"],
+            4,
+        ),
+        (
+            "导出执行层",
+            "ExportContext / ExportPipeline / ExportStepRegistry 负责把当前会话转换成导出计划，再驱动具体步骤产生产物。",
+            ["exportcontext", "exportpipeline", "exportstepregistry", "exportsceneblueprintruntimedatastep", "exportunifiednavdescriptorstep"],
+            5,
+        ),
+        (
+            "运行时契约层",
+            "导出结果最终收敛为运行时资产或 JSON 契约，例如 SceneBlueprintRuntimeData、HomeMapRuntimePackageData、UnifiedNavExportDescriptorData。",
+            ["sceneblueprintruntimedata", "homemapruntimepackagedata", "unifiednavexportdescriptordata", "runtimepackageexportservice"],
+            5,
+        ),
+        (
+            "外部桥接层",
+            "Integration / Bridge 目录中的桥接代码负责把统一会话语义扩散到其他模块或外部编辑工作流。",
+            ["stagedesignerintegration", "mapeditorbridge"],
+            3,
+        ),
+    ]
+
+    lines = [
+        "这一节优先依据 `understanding/14-code-evidence-registry.json` 中的代码锚点归纳框架，而不是平铺目录清单。",
+    ]
+    if docs:
+        lines.append(f"建议先用 `{docs[0].path}` 建立概念，再对照下面的代码层次落到实现。")
+        lines.append("")
+
+    written = 0
+    for label, summary, patterns, limit in definitions:
+        items = find_code_items_by_path_patterns(code_registry, patterns, limit=limit)
+        if not items:
+            continue
+        written += 1
+        lines.append(f"- {label}")
+        lines.append(f"  职责：{summary}")
+        lines.append(f"  锚点：{render_code_anchor_refs(items, limit=limit)}")
+
+    if not written:
+        return "当前还没有足够稳定的代码锚点来归纳框架层次，建议先人工确认入口、会话、导出和运行时这四层。"
+    return "\n".join(lines)
+
+
+def render_dependency_section(
+    configs: list[EvidenceItem],
+    related_refs: list[EvidenceItem],
+    code_registry: dict[str, object],
+) -> str:
+    bridge_items = get_code_items_by_category(code_registry, "bridge", limit=3)
+    runtime_items = get_code_items_by_category(code_registry, "runtime", limit=2)
+
+    if not configs and not related_refs and not bridge_items and not runtime_items:
         return "当前未发现典型配置文件或外部引用线索，建议确认依赖声明、环境配置和跨模块关系是否散落在其他目录或平台配置中。"
 
-    lines = []
-    for item in configs[:10]:
+    lines = [
+        "这一节只保留对接手最重要的依赖与边界：程序集/配置声明、运行时消费边界，以及仓库内的外部耦合点。",
+    ]
+    for item in configs[:6]:
         dependency_hint = extract_dependency_hint(item)
         lines.append(f"- `{item.path}`")
         lines.append(f"  线索：{dependency_hint}")
-    if related_refs:
-        if lines:
-            lines.append("")
-        lines.append("目标模块在仓库其他位置的引用：")
-        for item in related_refs[:8]:
+    if runtime_items:
+        lines.append("")
+        lines.append("运行时或对外消费边界：")
+        for item in runtime_items:
+            lines.append(f"- `{item.get('path', 'unknown')}`")
+            lines.append(f"  代码锚点：`{item.get('id', 'code-unknown')}` `{item.get('symbol', 'unknown')}`")
+    if related_refs or bridge_items:
+        lines.append("")
+        lines.append("仓库内明确可见的外部耦合点：")
+        for item in bridge_items:
+            lines.append(f"- `{item.get('path', 'unknown')}`")
+            lines.append(f"  代码锚点：`{item.get('id', 'code-unknown')}` `{item.get('symbol', 'unknown')}`")
+        for item in related_refs[:5]:
             lines.append(f"- `{item.path}`")
             lines.append(f"  线索：{item.summary}")
     return "\n".join(lines)
@@ -1314,24 +2256,103 @@ def render_flow_section(
     scripts: list[EvidenceItem],
     docs: list[EvidenceItem],
     related_refs: list[EvidenceItem],
+    code_registry: dict[str, object],
+    change_rows: list[dict[str, object]],
 ) -> str:
     lines = [
-        "第一版工作流不会自动还原完整调用图，下面整理的是适合人工继续追踪的阅读顺序。",
+        "这一节优先根据 `14` 的代码锚点和 `15` 的变更面，归纳接手人最该先理解的主干链路。",
+        "建议先把主链记成：`EntryWindow / HomeMapEntryWindow -> SceneSessionRequest + SceneProfile -> EditorSession.StartSession(...) -> SceneOperationRouter -> SceneModuleSetRegistry / SceneModuleSet -> ExportContext / ExportPipeline / ExportStepRegistry -> ExportStep / HomeMapRuntimePackageExportService -> SceneBlueprintRuntimeData / HomeMapRuntimePackageData / UnifiedNavExportDescriptorData`。",
     ]
-    if entrypoints:
-        lines.append("优先从以下入口文件入手：")
-        lines.extend(f"- `{item.path}`" for item in entrypoints[:5])
+
+    unified_chain = [
+        (
+            "请求建模",
+            "用统一的场景请求对象表达启动意图，而不是散落的 level/homeMapId 参数。",
+            find_code_items_by_path_patterns(code_registry, ["scenesessionrequest", "/editor/sceneprofiles/sceneprofile.cs", "homemapsceneprofile"], limit=4),
+        ),
+        (
+            "会话宿主",
+            "由 EditorSession 承接 Start/Stop 生命周期、Redux 初始化、事件注册和模块编排。",
+            find_code_items_by_path_patterns(code_registry, ["editorsession"], limit=3),
+        ),
+        (
+            "能力路由",
+            "通过 SceneOperationRouter 根据 SceneProfile / Capability / Identity 决定可用能力与显示名、稳定场景标识。",
+            find_code_items_by_path_patterns(code_registry, ["sceneoperationrouter"], limit=3),
+        ),
+        (
+            "模块装配",
+            "通过 SceneModuleSet / SceneModuleSetRegistry 把 SceneProfile 映射成模块集合，决定会话启动时实际装配哪些能力。",
+            find_code_items_by_path_patterns(code_registry, ["scenemodulesetregistry", "scenemoduleset"], limit=3),
+        ),
+        (
+            "导出主链",
+            "导出上下文与步骤注册器把当前场景转成可执行的导出计划，并开始向运行时产物收敛。",
+            find_code_items_by_path_patterns(
+                code_registry,
+                ["exportcontext", "exportpipeline", "exportstepregistry", "exportsceneblueprintruntimedata", "exportunifiednavdescriptor", "runtimepackageexportservice"],
+                limit=6,
+            ),
+        ),
+        (
+            "运行时落地",
+            "最终产物会沉淀为运行时可消费的数据资产或 JSON 契约，例如 SceneBlueprintRuntimeData / RuntimePackage / UnifiedNavDescriptor。",
+            find_code_items_by_path_patterns(
+                code_registry,
+                ["sceneblueprintruntimedata", "homemapruntimepackagedata", "unifiednavexportdescriptordata"],
+                limit=5,
+            ),
+        ),
+    ]
+
+    rendered_chain = 0
+    lines.append("当前自动归纳出的统一主链如下：")
+    for title, summary, matched in unified_chain:
+        if not matched:
+            continue
+        rendered_chain += 1
+        lines.append(f"- {title}")
+        lines.append(f"  含义：{summary}")
+        lines.append(f"  关键锚点：{render_code_anchor_refs(matched, limit=4)}")
+    if rendered_chain:
+        lines.append("")
+
+    flow_definitions = [
+        ("入口受理", ["entrypoint"], "窗口或入口命令接收用户动作，并决定进入哪条编辑工作流。"),
+        ("会话与能力装配", ["session", "home_map"], "会话、路由和模块装配决定当前场景能做什么、加载哪些专属能力。"),
+        ("导出与同步执行", ["export", "sync"], "编辑态数据会进入导出/同步上下文，生成步骤计划、目录和产物。"),
+        ("运行时消费与外部联动", ["runtime", "bridge"], "运行时数据、桥接接口和外部模块消费这些结果并形成联调边界。"),
+    ]
+
+    written = 0
+    for title, categories, summary in flow_definitions:
+        matched: list[dict[str, object]] = []
+        for category in categories:
+            matched.extend(get_code_items_by_category(code_registry, category, limit=2))
+        matched = matched[:3]
+        if not matched:
+            continue
+        written += 1
+        lines.append(f"- {title}")
+        lines.append(f"  流程含义：{summary}")
+        lines.append(f"  关键锚点：{render_code_anchor_refs(matched, limit=3)}")
+
+    if change_rows:
+        lines.append("")
+        lines.append("当前自动识别到的高风险流转节点：")
+        for row in sorted(change_rows, key=lambda item: 0 if item.get("risk") == "high" else 1)[:3]:
+            locations = " / ".join(f"`{path}`" for path in row.get("locations", [])[:2])
+            lines.append(f"- {row.get('change_surface', '未知变更面')}")
+            lines.append(f"  影响：{row.get('downstream', '需人工补充')}")
+            if locations:
+                lines.append(f"  位置：{locations}")
+
     if scripts:
-        lines.append("与运行或运维相关的脚本：")
-        lines.extend(f"- `{item.path}`" for item in scripts[:5])
-    if docs:
-        lines.append("可交叉验证的文档：")
-        lines.extend(f"- `{item.path}`" for item in docs[:5])
-    if related_refs:
-        lines.append("可继续追踪的外部耦合点：")
-        lines.extend(f"- `{item.path}`" for item in related_refs[:5])
-    if len(lines) == 1:
-        lines.append("尚未发现明显入口或说明文档，建议从目标目录中命名最明确的源码文件开始逆向整理。")
+        lines.append("")
+        lines.append("补充线索：发现可能参与运维或批处理的脚本/流程文件。")
+        lines.extend(f"- `{item.path}`" for item in scripts[:3])
+    if not written and not change_rows:
+        lines.append("尚未形成稳定的数据流主线，建议先从入口窗口、会话宿主、导出上下文这三类文件反向梳理。")
     return "\n".join(lines)
 
 
@@ -1348,7 +2369,7 @@ def render_risk_section(task: dict[str, object], evidence: list[EvidenceItem]) -
         risks.append("缺少现成文档，接手人需要更多时间通过代码建立模块心智模型。")
     if not entrypoints:
         risks.append("未识别出明显入口文件，启动链路和核心流程可能需要额外人工梳理。")
-    if configs and not any(item.path.lower().startswith("docs/") for item in docs):
+    if configs and not docs:
         risks.append("存在配置线索但缺少对应说明文档，环境差异与默认值可能成为隐性风险。")
     if related_refs:
         risks.append("目标模块与仓库其他模块存在显式引用，交接时需要补清楚调用方向、责任边界和联调方式。")
@@ -1363,6 +2384,19 @@ def render_risk_section(task: dict[str, object], evidence: list[EvidenceItem]) -
     return "\n".join(f"- {risk}" for risk in risks)
 
 
+def render_open_questions_section(task: dict[str, object], evidence: list[EvidenceItem]) -> str:
+    questions = build_open_questions(task, evidence)
+    if not questions:
+        return "当前没有自动归纳出待确认问题，建议离职人手工补充业务背景、环境差异和常见故障处理方式。"
+
+    lines = [
+        "下面这些问题建议在正式交接前由模块作者补齐。单文档 handover 会直接展示它们，不再要求接手人单独打开另一份问题列表。",
+    ]
+    for question in questions[:8]:
+        lines.append(f"- {question}")
+    return "\n".join(lines)
+
+
 def render_handover_advice(
     entrypoints: list[EvidenceItem],
     configs: list[EvidenceItem],
@@ -1370,10 +2404,13 @@ def render_handover_advice(
     scripts: list[EvidenceItem],
     related_refs: list[EvidenceItem],
     code_registry: dict[str, object],
+    change_rows: list[dict[str, object]],
 ) -> str:
     reading_order = []
     reading_order.extend(item.path for item in docs[:2])
-    reading_order.extend(extract_priority_code_paths(code_registry, limit=3))
+    reading_order.extend(extract_priority_code_paths(code_registry, limit=18))
+    for row in change_rows[:3]:
+        reading_order.extend(row.get("locations", [])[:2])
     reading_order.extend(item.path for item in entrypoints[:2])
     reading_order.extend(item.path for item in configs[:2])
     reading_order.extend(item.path for item in scripts[:2])
@@ -1389,60 +2426,136 @@ def render_handover_advice(
     for index, path in enumerate(reading_order, start=1):
         lines.append(f"{index}. `{path}`")
     lines.append("")
-    lines.append("完成首轮阅读后，优先补齐 `open-questions.md` 中的人工信息。")
+    if change_rows:
+        lines.append("优先把上面路径和 `understanding/15-change-impact-matrix.md` 的前三个高风险改动面一起联读。")
+        lines.append("")
+    lines.append("完成首轮阅读后，优先回到本交接文档中的“待确认问题”一节逐项补全人工信息。")
     return "\n".join(lines)
 
 
 def render_code_evidence_section(code_registry: dict[str, object]) -> str:
-    items = code_registry.get("items", []) if isinstance(code_registry, dict) else []
+    items = get_code_items(code_registry)
     if not items:
         return "当前未生成稳定的代码级 evidence，建议优先人工补齐统一入口、会话宿主和导出/同步上下文这三类关键锚点。"
 
     lines = [
-        "这一节列出自动提取出的关键代码锚点，用来把高层结论落到具体文件和符号上。",
+        "这一节直接摘取 `understanding/14-code-evidence-registry.json` 里的高价值锚点，方便把框架和风险落到具体代码。",
     ]
-    for item in items[:8]:
-        path = item.get("path", "unknown")
-        symbol = item.get("symbol", "unknown")
-        line_no = item.get("startLine", 1)
-        role = item.get("role", "关键代码锚点")
-        code_id = item.get("id", "code-unknown")
-        impacts = ", ".join(item.get("impacts", [])[:3]) if isinstance(item.get("impacts"), list) else ""
-        lines.append(f"- `{code_id}` `{path}:{line_no}` `{symbol}`")
-        lines.append(f"  作用：{role}")
-        if impacts:
-            lines.append(f"  影响面：{impacts}")
+    definitions = [
+        ("entrypoint", "入口锚点"),
+        ("session", "会话锚点"),
+        ("home_map", "HomeMap 锚点"),
+        ("export", "导出锚点"),
+        ("runtime", "运行时锚点"),
+        ("bridge", "桥接锚点"),
+    ]
+    written = 0
+    for category, label in definitions:
+        matched = get_code_items_by_category(code_registry, category, limit=2)
+        if not matched:
+            continue
+        written += 1
+        lines.append(f"- {label}")
+        for item in matched:
+            path = item.get("path", "unknown")
+            symbol = item.get("symbol", "unknown")
+            line_no = item.get("startLine", 1)
+            role = item.get("role", "关键代码锚点")
+            code_id = item.get("id", "code-unknown")
+            impacts = ", ".join(item.get("impacts", [])[:3]) if isinstance(item.get("impacts"), list) else ""
+            lines.append(f"  `{code_id}` `{path}:{line_no}` `{symbol}`")
+            lines.append(f"  作用：{role}")
+            if impacts:
+                lines.append(f"  影响面：{impacts}")
+    if not written:
+        return "当前未生成稳定的关键代码锚点，建议优先人工确认入口窗口、会话宿主和导出上下文。"
     lines.append("")
     lines.append("完整代码锚点列表见 `understanding/14-code-evidence-registry.json`。")
     return "\n".join(lines)
 
 
-def render_change_impact_section(code_registry: dict[str, object]) -> str:
-    rows = build_change_impact_rows(code_registry.get("items", []) if isinstance(code_registry, dict) else [])
-    if not rows:
+def render_change_impact_section(change_rows: list[dict[str, object]]) -> str:
+    if not change_rows:
         return "当前未自动识别出稳定的变更影响矩阵，建议至少先人工补齐“会话模型、路径命名、导出/同步上下文”三类高风险改动面。"
 
     lines = [
-        "下面整理的是更贴近维护动作的“改动面 -> 影响 -> 回归”提示。",
+        "这一节直接从 `understanding/15-change-impact-matrix.md` 摘取最值得接手人先记住的改动风险。",
     ]
-    for row in rows[:4]:
-        locations = " / ".join(f"`{path}`" for path in row["locations"][:2])
-        code_refs = " ".join(f"`{code_id}`" for code_id in row["code_ids"][:4])
+    for row in sorted(change_rows, key=lambda item: 0 if item.get("risk") == "high" else 1)[:4]:
+        locations = " / ".join(f"`{path}`" for path in row.get("locations", [])[:2])
+        code_refs = " ".join(f"`{code_id}`" for code_id in row.get("code_ids", [])[:4])
         lines.append(f"- {row['change_surface']}")
         lines.append(f"  典型位置：{locations}")
         lines.append(f"  影响：{row['downstream']}")
         lines.append(f"  必查：{row['contracts']}")
         lines.append(f"  回归：{row['regressions']}")
+        lines.append(f"  风险等级：{row['risk']}")
         lines.append(f"  代码锚点：{code_refs}")
     lines.append("")
     lines.append("完整变更矩阵见 `understanding/15-change-impact-matrix.md`。")
     return "\n".join(lines)
 
 
-def render_reference_section(evidence: list[EvidenceItem]) -> str:
+def render_reference_section(
+    evidence: list[EvidenceItem],
+    code_registry: dict[str, object],
+    change_rows: list[dict[str, object]],
+) -> str:
+    evidence_map = {item.id: item for item in evidence}
+    priority_ids: list[str] = []
+    for item in get_code_items(code_registry):
+        priority_ids.extend(str(linked) for linked in item.get("linkedEvidence", []))
+    for row in change_rows:
+        priority_ids.extend(str(ev_id) for ev_id in row.get("evidence_ids", []))
+
+    prioritized: list[EvidenceItem] = []
+    seen_ids: set[str] = set()
+    for evidence_id in priority_ids:
+        item = evidence_map.get(evidence_id)
+        if item and item.id not in seen_ids:
+            prioritized.append(item)
+            seen_ids.add(item.id)
+    for item in sort_docs_for_handover(filter_evidence(evidence, "doc"))[:4]:
+        if item.id not in seen_ids:
+            prioritized.append(item)
+            seen_ids.add(item.id)
+    for item in evidence:
+        if len(prioritized) >= 16:
+            break
+        if item.id in seen_ids:
+            continue
+        prioritized.append(item)
+        seen_ids.add(item.id)
+
     lines = []
-    for item in evidence[:25]:
+    for item in prioritized[:16]:
         lines.append(f"- `{item.id}` `{item.path}`: {item.summary}")
+    return "\n".join(lines)
+
+
+def render_internal_layer_section(understanding_dir: Path) -> str:
+    descriptions = {
+        "14-code-evidence-registry.json": "关键代码锚点注册表，给 Agent 和生成链定位“哪些代码不能跳过”。",
+        "15-change-impact-matrix.md": "改动面 -> 影响 -> 回归矩阵，给生成链提炼高风险改动建议。",
+        "scan-summary.md": "内部扫描摘要，记录本次证据采样覆盖情况。",
+        "open-questions.md": "内部待确认问题列表，供 handover 汇总和离职人补充。",
+    }
+
+    files = sorted(
+        [path for path in understanding_dir.iterdir() if path.is_file()],
+        key=lambda path: path.name.lower(),
+    )
+    if not files:
+        return "当前没有内部生成层文件。"
+
+    lines = [
+        "`understanding/` 已明确定位为内部生成层，不是交接人默认阅读入口。本 handover 已经把其中适合人读的内容整合进正文。",
+        "当前内部层文件包括：",
+    ]
+    for path in files:
+        description = descriptions.get(path.name, "内部生成材料，可用于追溯 handover 中的结构化结论。")
+        lines.append(f"- `understanding/{path.name}`")
+        lines.append(f"  作用：{description}")
     return "\n".join(lines)
 
 
